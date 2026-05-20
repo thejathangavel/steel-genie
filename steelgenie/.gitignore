@@ -5,6 +5,7 @@ node_modules/
 __pycache__/
 .venv/
 .env
+.env.local
 
 # Next.js
 frontend/.next/
@@ -14,4 +15,5 @@ dist/
 build/
 *.log
 
+#uploads
 uploads/
