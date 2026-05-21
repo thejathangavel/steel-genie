@@ -110,9 +110,35 @@ export default function Home() {
   const [cropMode, setCropMode]           = useState(false);
   const [cropDrag, setCropDrag]           = useState<CropRect | null>(null);
   const [cropRect, setCropRect]           = useState<CropRect | null>(null);
+  const [activeTool, setActiveTool]       = useState<"select"|"hand"|"ruler"|"marker">("select");
+  const [isPanning, setIsPanning]         = useState(false);
+  const [panStart, setPanStart]           = useState({ x: 0, y: 0, scrollLeft: 0, scrollTop: 0 });
+  const [rulerStart, setRulerStart]       = useState<{x:number;y:number}|null>(null);
+  const [rulerEnd, setRulerEnd]           = useState<{x:number;y:number}|null>(null);
+  const [rulerDragging, setRulerDragging] = useState(false);
+  const [markerDots, setMarkerDots]       = useState<{x:number;y:number}[]>([]);
+  const [rulerLines, setRulerLines]       = useState<{x1:number;y1:number;x2:number;y2:number}[]>([]);
+  const [undoStack, setUndoStack]         = useState<Array<"marker"|"ruler">>([]);
+  const [showSaveModal, setShowSaveModal]         = useState(false);
+  const [saveProjectName, setSaveProjectName]     = useState("");
+  const [saveLoading, setSaveLoading]             = useState(false);
+  const [showProjectsModal, setShowProjectsModal] = useState(false);
+  const [savedProjects, setSavedProjects]         = useState<any[]>([]);
+  const [projectsLoading, setProjectsLoading]     = useState(false);
 
-  const fileInputRef    = useRef<HTMLInputElement>(null);
-  const imageWrapperRef = useRef<HTMLDivElement>(null);
+  // ── MULTI-PAGE ────────────────────────────────────────────────────────────
+  const [currentPageIdx, setCurrentPageIdx]   = useState(0);
+  const [pageThumbnails, setPageThumbnails]   = useState<string[]>([]);
+  const [pageImageCache, setPageImageCache]   = useState<Record<number, string>>({});
+  const [pageDataCache, setPageDataCache]     = useState<Record<number, {
+    members: Member[]; summary: Summary | null; status: "not_set" | "estimating" | "built";
+  }>>({});
+  const [pageLoading, setPageLoading]         = useState(false);
+  const [extracting, setExtracting]           = useState(false);
+
+  const fileInputRef       = useRef<HTMLInputElement>(null);
+  const imageWrapperRef    = useRef<HTMLDivElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
 
   // ── DERIVED SUMMARY — recomputes live; filters to crop region when active ──
   const regionMembers = useMemo(() => {
@@ -190,12 +216,11 @@ export default function Home() {
   }
 
   const onWheel = useCallback((e: React.WheelEvent) => {
-    if (!e.ctrlKey && !e.metaKey) return;
     e.preventDefault();
     stepZoom(e.deltaY < 0 ? 1 : -1);
   }, []);
 
-  // ── CROP HELPERS ──────────────────────────────────────────────────────────
+  // ── CANVAS INTERACTION HELPERS ────────────────────────────────────────────
   function getImgPct(e: React.MouseEvent): { x: number; y: number } {
     const el = imageWrapperRef.current;
     if (!el) return { x: 0, y: 0 };
@@ -205,18 +230,59 @@ export default function Home() {
       y: Math.max(0, Math.min(1, (e.clientY - r.top)   / r.height)),
     };
   }
-  function onCropMouseDown(e: React.MouseEvent) {
+
+  function onCanvasMouseDown(e: React.MouseEvent) {
+    if (activeTool === "hand") {
+      e.preventDefault();
+      setIsPanning(true);
+      const sc = scrollContainerRef.current;
+      setPanStart({ x: e.clientX, y: e.clientY, scrollLeft: sc?.scrollLeft ?? 0, scrollTop: sc?.scrollTop ?? 0 });
+      return;
+    }
+    if (activeTool === "ruler") {
+      e.preventDefault();
+      const p = getImgPct(e);
+      setRulerStart(p); setRulerEnd(p); setRulerDragging(true);
+      return;
+    }
+    if (activeTool === "marker") {
+      const p = getImgPct(e);
+      setMarkerDots(prev => [...prev, p]);
+      setUndoStack(prev => [...prev, "marker"]);
+      return;
+    }
     if (!cropMode) return;
     e.preventDefault();
     const p = getImgPct(e);
     setCropDrag({ x0: p.x, y0: p.y, x1: p.x, y1: p.y });
   }
-  function onCropMouseMove(e: React.MouseEvent) {
+
+  function onCanvasMouseMove(e: React.MouseEvent) {
+    if (activeTool === "hand" && isPanning) {
+      const sc = scrollContainerRef.current;
+      if (!sc) return;
+      sc.scrollLeft = panStart.scrollLeft - (e.clientX - panStart.x);
+      sc.scrollTop  = panStart.scrollTop  - (e.clientY - panStart.y);
+      return;
+    }
+    if (activeTool === "ruler" && rulerDragging) {
+      setRulerEnd(getImgPct(e));
+      return;
+    }
     if (!cropMode || !cropDrag) return;
     const p = getImgPct(e);
     setCropDrag(prev => prev ? { ...prev, x1: p.x, y1: p.y } : null);
   }
-  function onCropMouseUp(e: React.MouseEvent) {
+
+  function onCanvasMouseUp(e: React.MouseEvent) {
+    if (activeTool === "hand") { setIsPanning(false); return; }
+    if (activeTool === "ruler" && rulerDragging && rulerStart) {
+      const p = getImgPct(e);
+      setRulerLines(prev => [...prev, { x1: rulerStart.x, y1: rulerStart.y, x2: p.x, y2: p.y }]);
+      setUndoStack(prev => [...prev, "ruler"]);
+      setRulerStart(null); setRulerEnd(null); setRulerDragging(false);
+      return;
+    }
     if (!cropMode || !cropDrag) return;
     const p  = getImgPct(e);
     const r: CropRect = {
@@ -259,6 +325,11 @@ export default function Home() {
       setSelectedScale(null);
       setSelectedRatio(null);
       setZoomLevel(1);
+      // Multi-page setup
+      setCurrentPageIdx(0);
+      setPageThumbnails(data.page_thumbnails ?? [data.image]);
+      setPageImageCache({ 0: data.image });
+      setPageDataCache({});
       showToast("blue", "Drawing uploaded. Select scale to begin.");
     } catch (err: any) {
       showToast("red", err.name === "AbortError" ? "Upload timed out" : "Upload failed. Check if backend is running.");
@@ -268,11 +339,9 @@ export default function Home() {
     }
   }
 
-  // ── SCALE SELECT → ANALYSIS ───────────────────────────────────────────────
-  async function handleScaleSelect(label: string, ratio: number) {
-    setSelectedScale(label);
-    setSelectedRatio(ratio);
-    setScaleOpen(false);
+  // ── CORE ANALYSIS (shared by scale-select and extract button) ────────────
+  async function runAnalysis(ratio: number, pageIdx: number) {
+    setExtracting(true);
     setStatus("estimating");
     setMembers([]);
     showToast("blue", "Building blueprint. Please wait...");
@@ -282,7 +351,7 @@ export default function Home() {
       const res = await fetch("http://localhost:8000/analyse", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ filename, scale_ratio: ratio, ocr_dpi: 400 }),
+        body: JSON.stringify({ filename, scale_ratio: ratio, page_index: pageIdx, ocr_dpi: 400 }),
         signal: controller.signal,
       });
       clearTimeout(timeoutId);
@@ -291,16 +360,145 @@ export default function Home() {
       setMembers(data.members);
       setBaseSummary(data.summary);
       setStatus("built");
+      // Cache per-page so switching back restores results
+      setPageDataCache(prev => ({
+        ...prev,
+        [pageIdx]: { members: data.members, summary: data.summary, status: "built" },
+      }));
       showToast("green", `Blueprint built in ${data.elapsed_seconds ?? data.elapsed ?? 0}s`);
       setTimeout(() => setToast(null), 4000);
     } catch (err: any) {
       showToast("red", err.name === "AbortError" ? "Analysis timed out" : "Analysis failed. Please try again.");
       setStatus("not_set");
+    } finally {
+      setExtracting(false);
+    }
+  }
+
+  // ── SCALE SELECT → ANALYSIS ───────────────────────────────────────────────
+  function handleScaleSelect(label: string, ratio: number) {
+    setSelectedScale(label);
+    setSelectedRatio(ratio);
+    setScaleOpen(false);
+    runAnalysis(ratio, currentPageIdx);
+  }
+
+  // ── EXTRACT BUTTON — re-runs analysis for current page + scale ────────────
+  async function handleExtract() {
+    if (!selectedRatio || extracting) return;
+    runAnalysis(selectedRatio, currentPageIdx);
+  }
+
+  // ── PAGE SWITCH ───────────────────────────────────────────────────────────
+  async function switchPage(newIdx: number) {
+    if (newIdx === currentPageIdx || pageLoading || extracting) return;
+
+    // Persist current page data so switching back restores it
+    setPageDataCache(prev => ({
+      ...prev,
+      [currentPageIdx]: { members, summary: baseSummary, status },
+    }));
+
+    setCurrentPageIdx(newIdx);
+    setCropRect(null); setCropMode(false); setCropDrag(null);
+    setMarkerDots([]); setRulerLines([]); setUndoStack([]);
+
+    // Restore cached extraction for the new page (if already extracted).
+    // pageDataCache is captured from current render — safe to read directly
+    // since switchPage is not memoized and always sees the latest cache.
+    const cached = pageDataCache[newIdx];
+    if (cached) {
+      setMembers(cached.members);
+      setBaseSummary(cached.summary);
+      setStatus(cached.status);
+    } else {
+      setMembers([]);
+      setBaseSummary(null);
+      setStatus("not_set");
+    }
+
+    // Load full-size image (from cache or backend)
+    if (pageImageCache[newIdx]) {
+      setPdfImage(pageImageCache[newIdx]);
+    } else {
+      setPageLoading(true);
+      try {
+        const res  = await fetch(`http://localhost:8000/page-image/${encodeURIComponent(filename)}/${newIdx}`);
+        const data = await res.json();
+        setPageImageCache(prev => ({ ...prev, [newIdx]: data.image }));
+        setPdfImage(data.image);
+      } catch {
+        showToast("red", "Failed to load page image.");
+      } finally {
+        setPageLoading(false);
+      }
     }
   }
 
   function showToast(type: Toast["type"], message: string) {
     setToast({ type, message });
+  }
+
+  async function handleSave() {
+    if (!saveProjectName.trim() || saveLoading) return;
+    setSaveLoading(true);
+    try {
+      const res = await fetch("http://localhost:8000/save-project", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: saveProjectName.trim(),
+          filename,
+          scale: selectedScale,
+          scale_ratio: selectedRatio,
+          members,
+          page_count: pageCount,
+        }),
+      });
+      if (!res.ok) throw new Error("Save failed");
+      showToast("green", `"${saveProjectName.trim()}" saved!`);
+      setTimeout(() => setToast(null), 4000);
+      setShowSaveModal(false);
+      setSaveProjectName("");
+    } catch {
+      showToast("red", "Failed to save project. Please try again.");
+    } finally {
+      setSaveLoading(false);
+    }
+  }
+
+  function handleUndo() {
+    if (undoStack.length === 0) return;
+    const last = undoStack[undoStack.length - 1];
+    if (last === "marker") setMarkerDots(d => d.slice(0, -1));
+    if (last === "ruler")  setRulerLines(l => l.slice(0, -1));
+    setUndoStack(prev => prev.slice(0, -1));
+  }
+
+  // Ctrl+Z keyboard shortcut for undo
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === "z" && !e.shiftKey) {
+        e.preventDefault();
+        handleUndo();
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [undoStack]);
+
+  async function handleLoadProjects() {
+    setShowProjectsModal(true);
+    setProjectsLoading(true);
+    try {
+      const res = await fetch("http://localhost:8000/saved-projects");
+      if (!res.ok) throw new Error();
+      setSavedProjects(await res.json());
+    } catch {
+      setSavedProjects([]);
+    } finally {
+      setProjectsLoading(false);
+    }
   }
 
   function handleReset() {
@@ -309,6 +507,12 @@ export default function Home() {
     setSelectedScale(null); setSelectedRatio(null);
     setToast(null); setZoomLevel(1); setContextMenu(null);
     setCropMode(false); setCropDrag(null); setCropRect(null);
+    setActiveTool("select"); setIsPanning(false);
+    setRulerStart(null); setRulerEnd(null); setRulerDragging(false);
+    setMarkerDots([]); setRulerLines([]); setUndoStack([]);
+    setCurrentPageIdx(0); setPageThumbnails([]);
+    setPageImageCache({}); setPageDataCache({});
+    setPageLoading(false); setExtracting(false);
   }
 
   const onDragOver  = useCallback((e: React.DragEvent) => { e.preventDefault(); setDragging(true); }, []);
@@ -376,6 +580,14 @@ export default function Home() {
             }}>{tab}</div>
           ))}
         </div>
+        <button onClick={() => setShowSaveModal(true)} style={{
+          backgroundColor: "#15803D", border: "1px solid #166534", color: "white",
+          borderRadius: "6px", padding: "4px 12px", fontSize: "13px", cursor: "pointer", fontWeight: "600",
+        }}>💾 Save</button>
+        <button onClick={handleLoadProjects} style={{
+          backgroundColor: "transparent", border: "1px solid #334155", color: "#94A3B8",
+          borderRadius: "6px", padding: "4px 12px", fontSize: "13px", cursor: "pointer",
+        }}>📂 Projects</button>
         <button onClick={handleReset} style={{
           backgroundColor: "transparent", border: "1px solid #334155", color: "#94A3B8",
           borderRadius: "6px", padding: "4px 12px", fontSize: "13px", cursor: "pointer",
@@ -390,10 +602,11 @@ export default function Home() {
           width: "220px", backgroundColor: "#1E293B", borderRight: "1px solid #0F172A",
           display: "flex", flexDirection: "column", overflow: "hidden", flexShrink: 0,
         }}>
-          <div style={{ padding: "10px 12px 6px", color: "#64748B", fontSize: "11px", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+          {/* Header */}
+          <div style={{ padding: "10px 12px 6px", color: "#64748B", fontSize: "11px", textTransform: "uppercase", letterSpacing: "0.05em", flexShrink: 0 }}>
             Navigation
           </div>
-          <div style={{ display: "flex", borderBottom: "1px solid #0F172A", padding: "0 12px" }}>
+          <div style={{ display: "flex", borderBottom: "1px solid #0F172A", padding: "0 12px", flexShrink: 0 }}>
             {["Pages", "Members"].map(tab => (
               <div key={tab} style={{
                 padding: "8px 12px", fontSize: "13px",
@@ -404,27 +617,10 @@ export default function Home() {
             ))}
           </div>
 
-          <div style={{ padding: "10px 10px 0" }}>
-            <img src={pdfImage} alt="Page thumbnail" style={{
-              width: "100%", height: "110px", objectFit: "cover",
-              borderRadius: "4px", border: "1px solid #334155", display: "block",
-            }} />
-            <div style={{ padding: "8px 4px", fontSize: "12px", color: "white", fontWeight: "600" }}>Page 1</div>
-            <div style={{ fontSize: "11px", color: "#64748B", marginBottom: "8px", padding: "0 4px" }}>
-              {pageCount} page{pageCount !== 1 ? "s" : ""}
-            </div>
+          {/* ── CONTROLS (above pages) ── */}
+          <div style={{ padding: "10px 10px 6px", flexShrink: 0 }}>
 
-            <div style={{ display: "flex", gap: "6px", marginBottom: "10px", padding: "0 4px" }}>
-              {status === "built" && (
-                <span style={{ backgroundColor: "#166534", color: "#86EFAC", fontSize: "10px", padding: "2px 8px", borderRadius: "4px", fontWeight: "600" }}>Built</span>
-              )}
-              {(status === "estimating" || status === "built") && (
-                <span style={{ backgroundColor: "#1E3A5F", color: "#93C5FD", fontSize: "10px", padding: "2px 8px", borderRadius: "4px", fontWeight: "600" }}>Estimating</span>
-              )}
-            </div>
-
-            <div style={{ borderTop: "1px solid #334155", margin: "0 4px 8px" }} />
-
+            {/* Bottom of Column */}
             <div style={{ display: "flex", justifyContent: "space-between", padding: "0 4px", marginBottom: "8px" }}>
               <span style={{ fontSize: "11px", color: "#64748B" }}>Bottom of Column</span>
               <span style={{ fontSize: "11px", color: "white" }}>-1&apos;-0&quot;</span>
@@ -469,7 +665,8 @@ export default function Home() {
               )}
             </div>
 
-            <div style={{ display: "flex", justifyContent: "space-between", padding: "0 4px" }}>
+            {/* Status row */}
+            <div style={{ display: "flex", justifyContent: "space-between", padding: "0 4px", marginBottom: "10px" }}>
               <span style={{ fontSize: "11px", color: "#64748B" }}>Status</span>
               <span style={{
                 fontSize: "11px", fontWeight: "600",
@@ -478,7 +675,102 @@ export default function Home() {
                 {status === "built" ? "Built" : status === "estimating" ? "Estimating" : "Not Set"}
               </span>
             </div>
+
+            {/* Extract button */}
+            <div style={{ padding: "0 4px", marginBottom: "8px" }}>
+              <button
+                onClick={handleExtract}
+                disabled={!selectedRatio || extracting}
+                style={{
+                  width: "100%", borderRadius: "5px", padding: "7px 0",
+                  fontSize: "12px", fontWeight: "700", cursor: selectedRatio && !extracting ? "pointer" : "not-allowed",
+                  backgroundColor: selectedRatio && !extracting ? "#1D4ED8" : "#1E293B",
+                  color: selectedRatio && !extracting ? "white" : "#475569",
+                  border: `1px solid ${selectedRatio && !extracting ? "#3B82F6" : "#334155"}`,
+                  transition: "all 0.15s",
+                }}
+              >
+                {extracting ? "⏳ Extracting…" : "⚡ Extract"}
+              </button>
+            </div>
+
+            <div style={{ borderTop: "1px solid #334155", margin: "0 4px 0" }} />
           </div>
+
+          {/* ── PAGE THUMBNAILS (below controls, scrollable) ── */}
+          <div style={{ flex: 1, overflowY: "auto", padding: "6px 8px" }}>
+            <div style={{ fontSize: "10px", color: "#475569", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: "6px", paddingLeft: "2px" }}>
+              {pageCount} page{pageCount !== 1 ? "s" : ""}
+            </div>
+            {pageThumbnails.map((thumb, idx) => {
+              const isActive  = idx === currentPageIdx;
+              const pgData    = pageDataCache[idx];
+              const pgBuilt   = pgData?.status === "built";
+              const pgLoading = pageLoading && idx === currentPageIdx;
+              return (
+                <div
+                  key={idx}
+                  onClick={() => switchPage(idx)}
+                  style={{
+                    marginBottom: "8px", cursor: "pointer", borderRadius: "6px",
+                    border: `2px solid ${isActive ? "#3B82F6" : "#1E293B"}`,
+                    backgroundColor: isActive ? "#0F2744" : "transparent",
+                    overflow: "hidden",
+                    transition: "border-color 0.15s",
+                    opacity: pgLoading ? 0.5 : 1,
+                  }}
+                >
+                  <img
+                    src={thumb}
+                    alt={`Page ${idx + 1}`}
+                    style={{ width: "100%", display: "block", objectFit: "cover" }}
+                  />
+                  <div style={{
+                    display: "flex", justifyContent: "space-between", alignItems: "center",
+                    padding: "4px 6px",
+                  }}>
+                    <span style={{ fontSize: "11px", color: isActive ? "white" : "#94A3B8", fontWeight: isActive ? "700" : "400" }}>
+                      Page {idx + 1}
+                    </span>
+                    <div style={{ display: "flex", gap: "4px" }}>
+                      {pgBuilt && (
+                        <span style={{ backgroundColor: "#166534", color: "#86EFAC", fontSize: "9px", padding: "1px 5px", borderRadius: "3px", fontWeight: "600" }}>Built</span>
+                      )}
+                      {pgBuilt && (
+                        <span style={{ backgroundColor: "#1E3A5F", color: "#93C5FD", fontSize: "9px", padding: "1px 5px", borderRadius: "3px", fontWeight: "600" }}>Est.</span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* TOOLS PANEL */}
+        <div style={{
+          width: "44px", backgroundColor: "#1E293B", borderRight: "1px solid #0F172A",
+          display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+          gap: "4px", flexShrink: 0,
+        }}>
+          <button title="Select" onClick={() => setActiveTool("select")} style={toolBtnStyle(activeTool === "select")}>↖</button>
+          <button title="Hand / Pan" onClick={() => setActiveTool("hand")} style={toolBtnStyle(activeTool === "hand")}>✋</button>
+          <div style={{ width: "28px", height: "1px", backgroundColor: "#334155", margin: "4px 0" }} />
+          <button title="Zoom In"  onClick={() => stepZoom(1)}  style={toolBtnStyle(false)}>+</button>
+          <button title="Zoom Out" onClick={() => stepZoom(-1)} style={toolBtnStyle(false)}>−</button>
+          <div style={{ width: "28px", height: "1px", backgroundColor: "#334155", margin: "4px 0" }} />
+          <button title="Ruler" onClick={() => setActiveTool("ruler")} style={toolBtnStyle(activeTool === "ruler")}>📏</button>
+          <button title="Marker" onClick={() => setActiveTool("marker")} style={toolBtnStyle(activeTool === "marker")}>✏️</button>
+          <div style={{ width: "28px", height: "1px", backgroundColor: "#334155", margin: "4px 0" }} />
+          <button
+            title="Undo (Ctrl+Z)"
+            onClick={handleUndo}
+            style={{
+              ...toolBtnStyle(false),
+              opacity: undoStack.length === 0 ? 0.3 : 1,
+              cursor: undoStack.length === 0 ? "not-allowed" : "pointer",
+            }}
+          >↩</button>
         </div>
 
         {/* CENTER: PDF VIEWER */}
@@ -489,22 +781,39 @@ export default function Home() {
           overflow: "hidden",            /* hard-clip so children never push layout */
         }}>
 
+          {/* ── Page loading overlay (shown while fetching a new page image) ── */}
+          {pageLoading && (
+            <div style={{
+              position: "absolute", inset: 0, zIndex: 200,
+              backgroundColor: "rgba(15,23,42,0.75)",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              backdropFilter: "blur(3px)",
+            }}>
+              <div style={{ color: "#93C5FD", fontSize: "14px", fontWeight: "600" }}>Loading page…</div>
+            </div>
+          )}
+
           {/* ── Scrollable image ── */}
           <div
+            ref={scrollContainerRef}
             onWheel={onWheel}
             style={{ position: "absolute", inset: 0, overflow: "auto" }}
           >
             {/* Width drives zoom; min-width keeps it filling the pane at ≤100% */}
             <div
               ref={imageWrapperRef}
-              onMouseDown={onCropMouseDown}
-              onMouseMove={onCropMouseMove}
-              onMouseUp={onCropMouseUp}
+              onMouseDown={onCanvasMouseDown}
+              onMouseMove={onCanvasMouseMove}
+              onMouseUp={onCanvasMouseUp}
               style={{
                 position: "relative",
                 width: `${zoomLevel * 100}%`, minWidth: "100%",
-                cursor: cropMode ? "crosshair" : "default",
-                userSelect: cropMode ? "none" : "auto",
+                cursor: activeTool === "hand"
+                  ? (isPanning ? "grabbing" : "grab")
+                  : (activeTool === "ruler" || activeTool === "marker" || cropMode)
+                    ? "crosshair"
+                    : "default",
+                userSelect: activeTool !== "select" || cropMode ? "none" : "auto",
               }}
             >
               <img
@@ -557,6 +866,28 @@ export default function Home() {
                     />
                   );
                 })}
+                {/* Saved ruler lines */}
+                {rulerLines.map((ln, i) => (
+                  <g key={`ruler-${i}`}>
+                    <line x1={`${ln.x1*100}%`} y1={`${ln.y1*100}%`} x2={`${ln.x2*100}%`} y2={`${ln.y2*100}%`}
+                      stroke="#F59E0B" strokeWidth="2" strokeDasharray="6 3" strokeLinecap="round" strokeOpacity="0.9" />
+                    <circle cx={`${ln.x1*100}%`} cy={`${ln.y1*100}%`} r="4" fill="#F59E0B" />
+                    <circle cx={`${ln.x2*100}%`} cy={`${ln.y2*100}%`} r="4" fill="#F59E0B" />
+                  </g>
+                ))}
+                {/* Live ruler preview while dragging */}
+                {rulerStart && rulerEnd && rulerDragging && (
+                  <>
+                    <line
+                      x1={`${rulerStart.x * 100}%`} y1={`${rulerStart.y * 100}%`}
+                      x2={`${rulerEnd.x * 100}%`}   y2={`${rulerEnd.y * 100}%`}
+                      stroke="#F59E0B" strokeWidth="2" strokeDasharray="6 3"
+                      strokeLinecap="round" strokeOpacity="0.9"
+                    />
+                    <circle cx={`${rulerStart.x * 100}%`} cy={`${rulerStart.y * 100}%`} r="4" fill="#F59E0B" />
+                    <circle cx={`${rulerEnd.x * 100}%`}   cy={`${rulerEnd.y * 100}%`}   r="4" fill="#F59E0B" />
+                  </>
+                )}
               </svg>
 
               {/* Live drag rectangle while drawing */}
@@ -616,13 +947,32 @@ export default function Home() {
                   const isColumn = m.type === "column";
                   const isBeam   = m.type === "beam";
                   const isHov    = hoveredMember === m;
+
+                  // Orientation-aware midpoint anchoring:
+                  // If we have exact span endpoints, always recompute the anchor
+                  // from them — this is the geometric truth regardless of what
+                  // the backend stored in m.x / m.y.
+                  let anchorX = m.x;
+                  let anchorY = m.y;
+                  if (isBeam && m.bx1 != null && m.bx2 != null && m.by1 != null && m.by2 != null) {
+                    if (m.beam_dir === "V") {
+                      // Vertical beam: x = beam centre x, y = midpoint(y1,y2)
+                      anchorX = (m.bx1 + m.bx2) / 2;
+                      anchorY = (m.by1 + m.by2) / 2;
+                    } else {
+                      // Horizontal beam: x = midpoint(x1,x2), y = beam centre y
+                      anchorX = (m.bx1 + m.bx2) / 2;
+                      anchorY = (m.by1 + m.by2) / 2;
+                    }
+                  }
+
                   return (
                     <div
                       key={idx}
                       style={{
                         position: "absolute",
-                        left: `${m.x * 100}%`,
-                        top:  `${m.y * 100}%`,
+                        left: `${anchorX * 100}%`,
+                        top:  `${anchorY * 100}%`,
                         transform: "translate(-50%, -50%)",
                         zIndex: 20, cursor: "pointer",
                       }}
@@ -636,14 +986,31 @@ export default function Home() {
                       }}
                     >
                       {isColumn ? (
-                        /* Column: I-shape marker (flange + web dot) */
-                        <div style={{ position: "relative" }}>
+                        /* Column: I-shape symbol + profile chip label */
+                        <div style={{ position: "relative", display: "flex", flexDirection: "column", alignItems: "center", gap: "2px" }}>
                           {m.overridden && (
                             <div style={{ position: "absolute", inset: "-4px", border: "1px dashed #FBBF24", borderRadius: "2px", pointerEvents: "none" }} />
                           )}
+                          {/* I-shape symbol */}
                           <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
                             <div style={{ width: "14px", height: "2px", backgroundColor: m.color, borderRadius: "1px", boxShadow: `0 0 3px ${m.color}` }} />
                             <div style={{ width: "3px", height: "3px", backgroundColor: m.color, borderRadius: "50%", marginTop: "1px" }} />
+                          </div>
+                          {/* Profile chip */}
+                          <div style={{
+                            backgroundColor: isHov ? "#1E3A5F" : "#1E3A5F88",
+                            border: `1px solid ${m.overridden ? "#FBBF24" : m.color}`,
+                            borderRadius: "3px",
+                            padding: "0px 3px",
+                            fontSize: "7px",
+                            fontWeight: "700",
+                            color: "white",
+                            whiteSpace: "nowrap",
+                            letterSpacing: "0.02em",
+                            boxShadow: isHov ? `0 0 5px ${m.color}` : "0 1px 3px rgba(0,0,0,0.5)",
+                            transition: "all 0.1s",
+                          }}>
+                            {m.profile}
                           </div>
                         </div>
                       ) : isBeam ? (
@@ -664,10 +1031,15 @@ export default function Home() {
                           boxShadow: isHov ? `0 0 6px ${m.color}` : "0 1px 3px rgba(0,0,0,0.5)",
                           transition: "all 0.1s",
                           letterSpacing: "0.02em",
+                          writingMode: m.beam_dir === "V" ? "vertical-rl" : undefined,
                         }}>
                           {m.profile}
                           {m.length_ft > 0 && (
-                            <span style={{ color: "#FBD0E8", marginLeft: "3px", fontWeight: 400 }}>
+                            <span style={{
+                              color: "#FBD0E8", fontWeight: 400,
+                              marginLeft: m.beam_dir === "V" ? "0" : "3px",
+                              marginTop:  m.beam_dir === "V" ? "2px" : "0",
+                            }}>
                               {formatFt(m.length_ft)}
                             </span>
                           )}
@@ -685,6 +1057,19 @@ export default function Home() {
                     </div>
                   );
                 })}
+                {/* Marker dots */}
+                {markerDots.map((dot, i) => (
+                  <div key={`dot-${i}`} style={{
+                    position: "absolute",
+                    left: `${dot.x * 100}%`, top: `${dot.y * 100}%`,
+                    transform: "translate(-50%, -50%)",
+                    width: "10px", height: "10px",
+                    backgroundColor: "#F59E0B", borderRadius: "50%",
+                    border: "2px solid white", zIndex: 22,
+                    pointerEvents: "none",
+                    boxShadow: "0 1px 4px rgba(0,0,0,0.5)",
+                  }} />
+                ))}
               </div>
             </div>
           </div>
@@ -825,6 +1210,119 @@ export default function Home() {
 
       {/* (no modal — region is shown inline on the image and counted in right panel) */}
 
+      {/* SAVE MODAL */}
+      {showSaveModal && (
+        <div style={{
+          position: "fixed", inset: 0, zIndex: 600,
+          backgroundColor: "rgba(0,0,0,0.7)",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          backdropFilter: "blur(4px)",
+        }}>
+          <div style={{
+            backgroundColor: "#1E293B", border: "1px solid #334155",
+            borderRadius: "12px", padding: "24px", minWidth: "340px",
+            boxShadow: "0 24px 64px rgba(0,0,0,0.7)",
+          }}>
+            <div style={{ color: "white", fontWeight: "bold", fontSize: "16px", marginBottom: "6px" }}>Save Project</div>
+            <div style={{ color: "#64748B", fontSize: "12px", marginBottom: "16px" }}>
+              Enter a name for this project to save it to the database.
+            </div>
+            <input
+              type="text"
+              value={saveProjectName}
+              onChange={e => setSaveProjectName(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && handleSave()}
+              placeholder="Project name…"
+              autoFocus
+              style={{
+                width: "100%", backgroundColor: "#0F172A",
+                border: "1px solid #334155", borderRadius: "6px",
+                padding: "9px 12px", color: "white", fontSize: "14px",
+                marginBottom: "16px", boxSizing: "border-box", outline: "none",
+              }}
+            />
+            <div style={{ display: "flex", gap: "8px", justifyContent: "flex-end" }}>
+              <button
+                onClick={() => { setShowSaveModal(false); setSaveProjectName(""); }}
+                style={{
+                  backgroundColor: "transparent", border: "1px solid #334155",
+                  color: "#94A3B8", borderRadius: "6px", padding: "8px 18px",
+                  cursor: "pointer", fontSize: "13px",
+                }}
+              >Cancel</button>
+              <button
+                onClick={handleSave}
+                disabled={!saveProjectName.trim() || saveLoading}
+                style={{
+                  backgroundColor: saveProjectName.trim() && !saveLoading ? "#1D4ED8" : "#334155",
+                  border: "none", color: "white", borderRadius: "6px",
+                  padding: "8px 18px", fontSize: "13px", fontWeight: "600",
+                  cursor: saveProjectName.trim() && !saveLoading ? "pointer" : "not-allowed",
+                }}
+              >{saveLoading ? "Saving…" : "OK"}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* PROJECTS MODAL */}
+      {showProjectsModal && (
+        <div
+          style={{
+            position: "fixed", inset: 0, zIndex: 600,
+            backgroundColor: "rgba(0,0,0,0.7)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            backdropFilter: "blur(4px)",
+          }}
+          onClick={() => setShowProjectsModal(false)}
+        >
+          <div
+            style={{
+              backgroundColor: "#1E293B", border: "1px solid #334155",
+              borderRadius: "12px", minWidth: "480px", maxWidth: "620px", width: "90vw",
+              boxShadow: "0 24px 64px rgba(0,0,0,0.7)", overflow: "hidden",
+            }}
+            onClick={e => e.stopPropagation()}
+          >
+            <div style={{
+              padding: "16px 20px", borderBottom: "1px solid #334155",
+              display: "flex", justifyContent: "space-between", alignItems: "center",
+            }}>
+              <span style={{ color: "white", fontWeight: "bold", fontSize: "15px" }}>Saved Projects</span>
+              <button onClick={() => setShowProjectsModal(false)} style={{
+                backgroundColor: "transparent", border: "1px solid #334155",
+                color: "#94A3B8", borderRadius: "4px", padding: "3px 10px",
+                cursor: "pointer", fontSize: "13px",
+              }}>✕</button>
+            </div>
+            <div style={{ maxHeight: "60vh", overflowY: "auto" }}>
+              {projectsLoading ? (
+                <div style={{ padding: "32px", textAlign: "center", color: "#64748B" }}>Loading…</div>
+              ) : savedProjects.length === 0 ? (
+                <div style={{ padding: "32px", textAlign: "center", color: "#64748B" }}>No saved projects yet.</div>
+              ) : savedProjects.map((p: any, i: number) => (
+                <div key={p.id ?? i} style={{
+                  padding: "14px 20px", borderBottom: "1px solid #0F172A",
+                  backgroundColor: i % 2 === 0 ? "transparent" : "#0A0F1A",
+                  display: "flex", justifyContent: "space-between", alignItems: "center",
+                }}>
+                  <div>
+                    <div style={{ color: "white", fontWeight: "600", fontSize: "14px", marginBottom: "3px" }}>{p.name}</div>
+                    <div style={{ color: "#64748B", fontSize: "12px" }}>
+                      {p.filename} · {p.scale ?? "No scale"} · {p.member_count ?? 0} members
+                    </div>
+                    <div style={{ color: "#475569", fontSize: "11px", marginTop: "2px" }}>
+                      {p.created_at ? new Date(p.created_at).toLocaleString() : ""}
+                    </div>
+                  </div>
+                  <span style={{ backgroundColor: "#166534", color: "#86EFAC", fontSize: "10px", padding: "2px 8px", borderRadius: "4px", flexShrink: 0 }}>Saved</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* CONTEXT MENU — right-click correction */}
       {contextMenu && (
         <div
@@ -948,6 +1446,21 @@ function ctxItemStyle(color: string): React.CSSProperties {
     padding: "9px 14px", fontSize: "13px", color, cursor: "pointer",
     display: "flex", alignItems: "center", gap: "8px",
     backgroundColor: "transparent", transition: "background 0.1s",
+  };
+}
+
+function toolBtnStyle(active: boolean): React.CSSProperties {
+  return {
+    width: "32px", height: "32px",
+    display: "flex", alignItems: "center", justifyContent: "center",
+    backgroundColor: active ? "#1D4ED8" : "transparent",
+    border: `1px solid ${active ? "#3B82F6" : "transparent"}`,
+    borderRadius: "6px",
+    color: active ? "white" : "#94A3B8",
+    fontSize: "15px",
+    cursor: "pointer",
+    flexShrink: 0,
+    transition: "background 0.1s",
   };
 }
 
