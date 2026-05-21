@@ -11,6 +11,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from PIL import Image as PILImage, ImageEnhance, ImageFilter
 
+# ── OpenCV-based raster beam line detector ───────────────────────────────────
+try:
+    from detection_cv import detect_beam_lines_raster as _detect_beam_lines_raster
+    _RASTER_HOUGH_AVAILABLE = True
+    print("[INIT] detection_cv.detect_beam_lines_raster loaded")
+except Exception as _e:
+    _RASTER_HOUGH_AVAILABLE = False
+    print(f"[INIT] detection_cv not available — raster Hough disabled: {_e}")
+
 # ── Load Environment ──────────────────────────────────────────────────────────
 try:
     from dotenv import load_dotenv
@@ -176,8 +185,8 @@ def detect_beam_lines(page, profiles: list, plan_bounds: tuple) -> dict:
     """
     bx0, by0, bx1, by1 = plan_bounds
     MIN_LEN  = 30    # ignore dimension ticks (<3 ft at 1/8")
-    MAX_LEN  = 650   # ignore full-plan grid and border lines
-    LABEL_R  = 30    # max distance from label to line axis / midpoint
+    MAX_LEN  = 1200  # raised: covers very long bays and 1/16" scale drawings
+    LABEL_R  = 70    # raised: labels on dense drawings can sit further from centreline
 
     h_lines: list[tuple] = []   # (lx1, ly, lx2, ly, length)
     v_lines: list[tuple] = []   # (lx, ly1, lx, ly2, length)
@@ -203,7 +212,7 @@ def detect_beam_lines(page, profiles: list, plan_bounds: tuple) -> dict:
                     # (with a small tolerance).  This prevents long annotation/
                     # dimension lines whose midpoint barely falls inside the plan
                     # from extending far into the notes or title block area.
-                    _EP_TOL = 50   # ≈ 0.7" — covers label offsets & small overruns
+                    _EP_TOL = 80   # ≈ 1.1" — proportional to widened plan boundary buffer
                     if (min(p1.x, p2.x) < bx0 - _EP_TOL or
                             max(p1.x, p2.x) > bx1 + _EP_TOL):
                         continue
@@ -510,10 +519,16 @@ def _get_text_dict(page, page_w: float = None, page_h: float = None
             try:
                 import cv2 as _cv2
                 _gray = np.array(pil_img.convert("L"))
+                # Step 1: CLAHE for local contrast (handles uneven ink/scan)
                 _clahe = _cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
                 _enhanced = _clahe.apply(_gray)
+                # Step 2: Unsharp mask to sharpen blurry scanned text.
+                # Scanned drawings often have low-frequency blur from the scanner
+                # optics; sharpening recovers thin strokes like "/" in "HSS6X6X3/8".
+                _blur    = _cv2.GaussianBlur(_enhanced, (0, 0), sigmaX=1.5)
+                _sharp   = _cv2.addWeighted(_enhanced, 1.5, _blur, -0.5, 0)
                 pil_img = PILImage.fromarray(
-                    _cv2.cvtColor(_enhanced, _cv2.COLOR_GRAY2RGB))
+                    _cv2.cvtColor(_sharp, _cv2.COLOR_GRAY2RGB))
             except Exception:
                 # Fallback: mild global contrast if cv2 unavailable
                 pil_img = PILImage.fromarray(
@@ -665,7 +680,8 @@ def find_plan_boundary(page, page_w, page_h, text_dict=None):
 
     # ── Gap detection on Y: drop labels below the first large vertical gap ─────
     # Large gap  ≡  notes / title block is separated from the structural plan.
-    # Threshold: 12% of page height (≈ 85–100 pt on a standard sheet).
+    # Threshold raised to 20% so that widely-spaced bottom grid rows (e.g. A.7→A)
+    # are NOT incorrectly trimmed — those rows still contain real structural members.
     if len(all_ys) >= 3:
         sorted_ys = sorted(all_ys)
         best_gap   = 0.0
@@ -675,7 +691,7 @@ def find_plan_boundary(page, page_w, page_h, text_dict=None):
             if g > best_gap:
                 best_gap   = g
                 gap_cutoff = sorted_ys[i]    # last Y before the gap
-        if best_gap > page_h * 0.12:
+        if best_gap > page_h * 0.28:         # was 0.12 — raised; only fires for very obvious title-block separation
             old_max = max(all_ys)
             all_xs = [all_xs[i] for i, y in enumerate(all_ys) if y <= gap_cutoff]
             all_ys = [y           for y in all_ys               if y <= gap_cutoff]
@@ -684,8 +700,9 @@ def find_plan_boundary(page, page_w, page_h, text_dict=None):
                       f"from {old_max:.0f} to {max(all_ys):.0f}")
 
     if len(all_xs) >= 2 and len(all_ys) >= 2:
-        # 40 pt buffer ≈ 0.55″ — covers any reasonable label-to-line offset
-        buf = 40
+        # 120 pt buffer ≈ 1.7″ — large enough to include member labels that sit
+        # below/beyond the outermost grid bubble (e.g. HSS10X8X3/8 FLAT at row A).
+        buf = 120
         b = (
             max(0,      min(all_xs) - buf),
             max(0,      min(all_ys) - buf),
@@ -697,7 +714,7 @@ def find_plan_boundary(page, page_w, page_h, text_dict=None):
         return b
 
     print("[BOUNDARY] fallback margins")
-    return (page_w * 0.04, page_h * 0.03, page_w * 0.96, page_h * 0.96)
+    return (page_w * 0.03, page_h * 0.02, page_w * 0.97, page_h * 0.98)
 
 
 # ── Column symbol detection (I/H cross-section marks in vector drawings) ──────
@@ -983,7 +1000,9 @@ def classify_member(profile: str,
         try:
             d1 = float(hss.group(1))
             d2 = float(hss.group(2))
-            return "column" if abs(d1 - d2) <= 2 else "beam"
+            # Only perfectly square HSS (e.g. HSS6X6, HSS8X8) are columns;
+            # all rectangular HSS spanning between grids are beams.
+            return "column" if abs(d1 - d2) < 0.5 else "beam"
         except ValueError:
             return "beam"
 
@@ -1175,11 +1194,48 @@ def extract_profiles(page, page_w, page_h, plan_bounds, text_dict=None):
 
 
 # ── Build members + summary ───────────────────────────────────────────────────
+def _span_valid(bx1f, by1f, bx2f, by2f, lx_frac, ly_frac, beam_dir) -> bool:
+    """
+    Sanity-check: the label must lie on (or very near) the computed span line.
+
+    Why this matters
+    ----------------
+    For vector PDFs detect_beam_lines() guarantees this by construction.
+    For the grid-based fallback (compute_beam_span), wrong grid-line matches
+    can produce span endpoints that are on the opposite side of the plan from
+    the label — the line appears visually far from the chip on screen.
+
+    Rules (all tolerances as fractions of the page dimension):
+      H-beam  — span Y must be within PERP_TOL of label Y
+                 label X must fall inside [bx1−EXT_TOL, bx2+EXT_TOL]
+      V-beam  — span X must be within PERP_TOL of label X
+                 label Y must fall inside [by1−EXT_TOL, by2+EXT_TOL]
+    """
+    PERP_TOL = 0.09   # perpendicular axis: 9 % of page length
+    EXT_TOL  = 0.12   # allow label up to 12 % beyond an endpoint (skewed labels)
+
+    if beam_dir == "H":
+        span_y = (by1f + by2f) / 2
+        if abs(ly_frac - span_y) > PERP_TOL:
+            return False
+        x_lo = min(bx1f, bx2f) - EXT_TOL
+        x_hi = max(bx1f, bx2f) + EXT_TOL
+        return x_lo <= lx_frac <= x_hi
+    else:   # "V"
+        span_x = (bx1f + bx2f) / 2
+        if abs(lx_frac - span_x) > PERP_TOL:
+            return False
+        y_lo = min(by1f, by2f) - EXT_TOL
+        y_hi = max(by1f, by2f) + EXT_TOL
+        return y_lo <= ly_frac <= y_hi
+
+
 def build_members(profiles, page_w, page_h,
                   column_symbols=None, v_grid=None, h_grid=None,
                   pts_per_foot: float = 0.0,
                   beam_dirs: dict = None,
-                  beam_line_map: dict = None):
+                  beam_line_map: dict = None,
+                  plan_bounds: tuple = None):
     """
     Two-pass pipeline that prevents beam labels near a column symbol from
     being falsely promoted to "column" (the old fan-out problem).
@@ -1279,37 +1335,112 @@ def build_members(profiles, page_w, page_h,
         if mtype == "beam":
             line_hit = (beam_line_map or {}).get(p_idx)
 
+            lx_frac = p["cx"] / page_w
+            ly_frac = p["cy"] / page_h
+
             if line_hit:
-                # ── PRIMARY: use the drawn vector line ──────────────────────
-                # Exact endpoints and exact length straight from the geometry.
+                # ── PRIMARY: trust the drawn vector line unconditionally ────
+                #
+                # detect_beam_lines() extracts PDF vector geometry — the line
+                # segment IS the beam centreline as drawn by the structural
+                # engineer.  Beam labels in complex drawings are often placed
+                # off to the side with a leader line, so the label's (cx, cy)
+                # can legitimately be 60–100 pt from the centreline.  Validating
+                # against label position causes valid matches to be discarded,
+                # leaving the chip at the label position while neighbouring
+                # beams' lines are drawn at the centreline — the visual
+                # "chip here, line over there" offset the user reported.
+                #
+                # We only reject a match when the line is too short to be a
+                # real structural bay (< MIN_STRUCT_PT).  Short lines are
+                # dimension ticks, hatch lines, or leader stubs that occasionally
+                # fall within LABEL_R of a label.
+                MIN_STRUCT_PT = 60   # ≈ 6 ft at 1/8" scale
                 beam_dir  = line_hit["dir"]
                 length_pt = line_hit["length_pt"]
-                length_ft = round(length_pt / pts_per_foot, 1) if pts_per_foot > 0 else 0.0
-                bx1 = round(line_hit["x1"] / page_w, 4)
-                by1 = round(line_hit["y1"] / page_h, 4)
-                bx2 = round(line_hit["x2"] / page_w, 4)
-                by2 = round(line_hit["y2"] / page_h, 4)
-                # FIX: chip/marker renders at TRUE SPAN MIDPOINT, not text label
-                render_cx = (line_hit["x1"] + line_hit["x2"]) / 2
-                render_cy = (line_hit["y1"] + line_hit["y2"]) / 2
+
+                if length_pt >= MIN_STRUCT_PT:
+                    length_ft = round(length_pt / pts_per_foot, 1) if pts_per_foot > 0 else 0.0
+                    bx1 = round(line_hit["x1"] / page_w, 4)
+                    by1 = round(line_hit["y1"] / page_h, 4)
+                    bx2 = round(line_hit["x2"] / page_w, 4)
+                    by2 = round(line_hit["y2"] / page_h, 4)
+                    # Chip renders at the TRUE midpoint of the span — this
+                    # guarantees the chip and the SVG line always coincide.
+                    render_cx = (line_hit["x1"] + line_hit["x2"]) / 2
+                    render_cy = (line_hit["y1"] + line_hit["y2"]) / 2
+                else:
+                    print(f"[BUILD] Vector match too short ({length_pt:.0f} pt) "
+                          f"for {p['profile']} — dropped as annotation line")
             else:
                 # ── FALLBACK: grid-based approximation ──────────────────────
-                # Used when the drawing has no detectable centreline
-                # (e.g. raster/image PDFs, or non-standard CAD exports).
-                # Priority: vector-based direction → OCR rotation hint → "H"
+                # Used when no vector centreline was found (raster images, or
+                # diagonal framing plans where H/V detection misses the beam).
+                # Priority: vector-based direction dict → OCR rotation hint → "H"
                 beam_dir = ((beam_dirs or {}).get(p_idx)
                             or p.get("dir_hint", "H"))
-                if v_grid and h_grid:
-                    span = compute_beam_span(
-                        p["cx"], p["cy"], v_grid, h_grid,
-                        pts_per_foot, beam_dir,
-                    )
-                    if span:
+
+                # Try both directions and pick whichever yields a geometrically
+                # valid span.  This helps pages where direction detection is
+                # unreliable (e.g. rotated/angled structural grids).
+                def _try_span(direction):
+                    if not (v_grid and h_grid):
+                        return None
+                    sp = compute_beam_span(
+                        p["cx"], p["cy"], v_grid, h_grid, pts_per_foot, direction)
+                    # Edge-beam extension: if no surrounding grid on one side,
+                    # extend with the plan boundary so perimeter beams get a length.
+                    if sp is None and plan_bounds:
+                        pb0x, pb0y, pb1x, pb1y = plan_bounds
+                        sp = compute_beam_span(
+                            p["cx"], p["cy"],
+                            sorted(set(v_grid) | {pb0x, pb1x}),
+                            sorted(set(h_grid) | {pb0y, pb1y}),
+                            pts_per_foot, direction)
+                    return sp
+
+                span = _try_span(beam_dir)
+
+                # If primary direction failed validation, try the other.
+                if span:
+                    _bx1 = round(span["x1"] / page_w, 4)
+                    _by1 = round(span["y1"] / page_h, 4)
+                    _bx2 = round(span["x2"] / page_w, 4)
+                    _by2 = round(span["y2"] / page_h, 4)
+                    if not _span_valid(_bx1, _by1, _bx2, _by2, lx_frac, ly_frac, beam_dir):
+                        print(f"[BUILD] Grid span invalid for {p['profile']} "
+                              f"dir={beam_dir} — trying opposite direction")
+                        alt_dir = "V" if beam_dir == "H" else "H"
+                        alt_span = _try_span(alt_dir)
+                        if alt_span:
+                            ab1 = round(alt_span["x1"] / page_w, 4)
+                            ab2 = round(alt_span["y1"] / page_h, 4)
+                            ab3 = round(alt_span["x2"] / page_w, 4)
+                            ab4 = round(alt_span["y2"] / page_h, 4)
+                            if _span_valid(ab1, ab2, ab3, ab4, lx_frac, ly_frac, alt_dir):
+                                span = alt_span
+                                _bx1, _by1, _bx2, _by2 = ab1, ab2, ab3, ab4
+                                beam_dir = alt_dir
+                            else:
+                                span = None   # both directions invalid
+                        else:
+                            span = None
+
+                if span:
+                    _bx1 = round(span["x1"] / page_w, 4)
+                    _by1 = round(span["y1"] / page_h, 4)
+                    _bx2 = round(span["x2"] / page_w, 4)
+                    _by2 = round(span["y2"] / page_h, 4)
+                    if _span_valid(_bx1, _by1, _bx2, _by2, lx_frac, ly_frac, beam_dir):
                         length_ft = span["length_ft"]
-                        bx1 = round(span["x1"] / page_w, 4)
-                        by1 = round(span["y1"] / page_h, 4)
-                        bx2 = round(span["x2"] / page_w, 4)
-                        by2 = round(span["y2"] / page_h, 4)
+                        bx1, by1, bx2, by2 = _bx1, _by1, _bx2, _by2
+                        render_cx = (span["x1"] + span["x2"]) / 2
+                        render_cy = (span["y1"] + span["y2"]) / 2
+                    else:
+                        print(f"[BUILD] Grid span discarded for {p['profile']} "
+                              f"(label=({lx_frac:.3f},{ly_frac:.3f}) "
+                              f"span=({_bx1:.3f},{_by1:.3f})→({_bx2:.3f},{_by2:.3f})"
+                              f" dir={beam_dir})")
 
         sym = profile_sym_pos.get(p_idx)
         members.append({
@@ -1356,12 +1487,20 @@ def build_summary(members):
     return s
 
 
-# ── Request model ─────────────────────────────────────────────────────────────
+# ── Request models ────────────────────────────────────────────────────────────
 class AnalysisRequest(BaseModel):
     filename:    str
     page_index:  int   = 0
     scale_ratio: float = None
     ocr_dpi:     int   = 400
+
+class SaveProjectRequest(BaseModel):
+    name:        str
+    filename:    str
+    scale:       str   = None
+    scale_ratio: int   = None
+    members:     list  = []
+    page_count:  int   = 1
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -1381,35 +1520,81 @@ async def upload_file(file: UploadFile = File(...)):
     with open(file_path, "wb") as f:
         f.write(content)
 
+    MAX_PREVIEW_W  = 2800   # full-size preview width cap
+    MAX_THUMB_W    = 220    # sidebar thumbnail width cap
+
+    def _render_page_to_b64(pil_img: "PILImage.Image", max_w: int, quality: int, fmt: str = "JPEG") -> str:
+        if pil_img.width > max_w:
+            ratio = max_w / pil_img.width
+            pil_img = pil_img.resize((max_w, int(pil_img.height * ratio)), PILImage.LANCZOS)
+        buf = io.BytesIO()
+        if fmt == "PNG":
+            pil_img.save(buf, format="PNG")
+            return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+        pil_img.save(buf, format="JPEG", quality=quality)
+        return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+
     ext = os.path.splitext(file.filename)[1].lower()
     if ext == ".pdf":
-        doc  = fitz.open(file_path)
-        page = doc[0]
-        # Render at 2× resolution so the preview stays crisp when the user zooms in to 200%.
-        # Matrix(2,2) = 144 dpi equivalent — sharp enough for line-art drawings without
-        # making the file too large.
-        pix  = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
-        pil  = PILImage.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        doc        = fitz.open(file_path)
         page_count = len(doc)
+
+        # Full-size preview for page 0 (viewed in the drawing window)
+        pix0 = doc[0].get_pixmap(matrix=fitz.Matrix(3.0, 3.0))
+        pil0 = PILImage.frombytes("RGB", [pix0.width, pix0.height], pix0.samples)
+
+        # Small thumbnails for every page (sidebar strip)
+        page_thumbnails = []
+        for i in range(page_count):
+            pix_t = doc[i].get_pixmap(matrix=fitz.Matrix(0.5, 0.5))
+            pil_t = PILImage.frombytes("RGB", [pix_t.width, pix_t.height], pix_t.samples)
+            page_thumbnails.append(_render_page_to_b64(pil_t, MAX_THUMB_W, 70))
+
         doc.close()
+        main_b64 = _render_page_to_b64(pil0, MAX_PREVIEW_W, 85, fmt="PNG")
     else:
         pil = PILImage.open(file_path).convert("RGB")
         page_count = 1
+        main_b64 = _render_page_to_b64(pil, MAX_PREVIEW_W, 85, fmt="PNG")
+        page_thumbnails = [_render_page_to_b64(
+            pil.resize((MAX_THUMB_W, int(pil.height * MAX_THUMB_W / pil.width)), PILImage.LANCZOS), MAX_THUMB_W, 70)]
 
-    # Cap preview image to 2800px wide (2× the old cap) to match the 2× render.
+    return {
+        "image":           main_b64,
+        "page_count":      page_count,
+        "filename":        file.filename,
+        "page_thumbnails": page_thumbnails,
+    }
+
+
+@app.get("/page-image/{filename}/{page_index}")
+async def get_page_image(filename: str, page_index: int):
+    """Return full-size preview for a specific page of an already-uploaded PDF."""
+    file_path = os.path.join(UPLOAD_DIR, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(404, "File not found")
+    ext = os.path.splitext(filename)[1].lower()
+    if ext == ".pdf":
+        doc = fitz.open(file_path)
+        if page_index < 0 or page_index >= len(doc):
+            doc.close()
+            raise HTTPException(404, f"Page {page_index} not found (total {len(doc)})")
+        pix = doc[page_index].get_pixmap(matrix=fitz.Matrix(3.0, 3.0))
+        pil = PILImage.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        doc.close()
+    else:
+        if page_index != 0:
+            raise HTTPException(404, "Image files have only one page")
+        pil = PILImage.open(file_path).convert("RGB")
+
     MAX_PREVIEW_W = 2800
     if pil.width > MAX_PREVIEW_W:
-        ratio = MAX_PREVIEW_W / pil.width
-        pil   = pil.resize((MAX_PREVIEW_W, int(pil.height * ratio)), PILImage.LANCZOS)
-
+        r = MAX_PREVIEW_W / pil.width
+        pil = pil.resize((MAX_PREVIEW_W, int(pil.height * r)), PILImage.LANCZOS)
     buf = io.BytesIO()
-    pil.save(buf, format="JPEG", quality=85)   # higher quality for crisp line-art
+    pil.save(buf, format="PNG")
     b64 = base64.b64encode(buf.getvalue()).decode()
-    return {
-        "image": f"data:image/jpeg;base64,{b64}",
-        "width": pil.width, "height": pil.height,
-        "page_count": page_count, "filename": file.filename,
-    }
+    return {"image": f"data:image/png;base64,{b64}", "page_index": page_index}
 
 
 @app.post("/analyse")
@@ -1482,23 +1667,46 @@ async def analyse_pdf(req: AnalysisRequest):
         pts_per_foot = scale_to_pts_per_foot(req.scale_ratio) if req.scale_ratio else 0.0
         print(f"[ANALYSE] scale_ratio={req.scale_ratio}  pts_per_foot={pts_per_foot:.2f}")
 
-        # 6. PRIMARY: match vector beam lines (skip for raster — no paths)
-        beam_line_map = (
-            {} if is_raster
-            else detect_beam_lines(page, profiles, plan_bounds)
-        )
+        # 6. PRIMARY: match beam centerlines to profile labels
+        #    • Vector PDF: read page.get_drawings() — exact mathematical geometry.
+        #    • Raster image: render to 300-DPI greyscale and run HoughLinesP.
+        #      Before this fix the raster path skipped this step entirely
+        #      (beam_line_map = {}), forcing 100 % of beams through the
+        #      grid-based fallback which only achieves bay-level precision.
+        if is_raster and _RASTER_HOUGH_AVAILABLE and profiles:
+            _DPI_HOUGH  = 300
+            _PX_PER_PT  = _DPI_HOUGH / 72.0
+            _pix        = page.get_pixmap(dpi=_DPI_HOUGH, colorspace=fitz.csGRAY)
+            _gray_arr   = np.frombuffer(_pix.samples, dtype=np.uint8).reshape(
+                              _pix.height, _pix.width)
+            beam_line_map = _detect_beam_lines_raster(
+                _gray_arr, profiles, plan_bounds, _PX_PER_PT)
+            print(f"[ANALYSE] Raster Hough beam_line_map: {len(beam_line_map)} hits")
+            del _pix, _gray_arr   # free memory
+        else:
+            beam_line_map = (
+                {} if is_raster
+                else detect_beam_lines(page, profiles, plan_bounds)
+            )
 
-        # 7. FALLBACK direction detection (vector drawings only)
-        # For raster images, direction is inferred from the OCR rotation pass
-        # stored in each profile's "dir_hint" field — see extract_profiles.
-        beam_dirs = (
-            {} if is_raster
-            else detect_beam_directions(page, profiles, plan_bounds)
-        )
+        # 7. FALLBACK direction detection
+        #    • Vector: use adjacent drawn lines via detect_beam_directions().
+        #    • Raster:  Hough hits already carry a 'dir' key; OCR rotation hints
+        #      (dir_hint) fill in for the remaining unmatched profiles.
         if is_raster:
-            h_hints = sum(1 for p in profiles if p.get("dir_hint", "H") == "H")
-            v_hints = sum(1 for p in profiles if p.get("dir_hint", "H") == "V")
-            print(f"[ANALYSE] Raster dir hints: H={h_hints}  V={v_hints}")
+            # Build beam_dirs from Hough results first, then fill gaps from dir_hint
+            beam_dirs: dict[int, str] = {}
+            for p_idx, hit in beam_line_map.items():
+                beam_dirs[p_idx] = hit["dir"]
+            # Any profile not matched by Hough falls back to OCR rotation hint
+            for p_idx, p in enumerate(profiles):
+                if p_idx not in beam_dirs:
+                    beam_dirs[p_idx] = p.get("dir_hint", "H")
+            h_hints = sum(1 for d in beam_dirs.values() if d == "H")
+            v_hints = sum(1 for d in beam_dirs.values() if d == "V")
+            print(f"[ANALYSE] Raster beam_dirs (Hough+hint): H={h_hints}  V={v_hints}")
+        else:
+            beam_dirs = detect_beam_directions(page, profiles, plan_bounds)
 
         # 8. Classify and build
         members = build_members(profiles, page_w, page_h,
@@ -1506,12 +1714,15 @@ async def analyse_pdf(req: AnalysisRequest):
                                 v_grid=v_grid, h_grid=h_grid,
                                 pts_per_foot=pts_per_foot,
                                 beam_dirs=beam_dirs,
-                                beam_line_map=beam_line_map)
+                                beam_line_map=beam_line_map,
+                                plan_bounds=plan_bounds)
         summary = build_summary(members)
 
         counts  = {t: summary[t] for t in ["column", "beam", "vertical_brace"]}
         elapsed = round(time.time() - start, 2)
-        method  = "pymupdf+ocr+grid" if is_raster else "pymupdf+symbols+grid"
+        method  = ("pymupdf+ocr+hough+grid" if (is_raster and _RASTER_HOUGH_AVAILABLE)
+                   else "pymupdf+ocr+grid"   if is_raster
+                   else "pymupdf+symbols+grid")
         print(f"[ANALYSE] {len(members)} members in {elapsed}s — {counts}")
 
         doc.close()
@@ -1533,6 +1744,65 @@ async def get_projects():
     if not supabase_client:
         raise HTTPException(503, "Supabase not configured")
     return supabase_client.table("projects").select("*, files(*)").execute().data
+
+
+_SAVED_FILE = os.path.join(BASE_DIR, "saved_projects.json")
+
+
+@app.post("/save-project")
+async def save_project(req: SaveProjectRequest):
+    import json as _json, uuid as _uuid
+
+    projects: list = []
+    if os.path.exists(_SAVED_FILE):
+        try:
+            with open(_SAVED_FILE, "r", encoding="utf-8") as f:
+                projects = _json.load(f)
+        except Exception:
+            projects = []
+
+    entry = {
+        "id":           str(_uuid.uuid4()),
+        "name":         req.name,
+        "filename":     req.filename,
+        "scale":        req.scale,
+        "scale_ratio":  req.scale_ratio,
+        "members":      req.members,
+        "member_count": len(req.members),
+        "page_count":   req.page_count,
+        "created_at":   time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    projects.insert(0, entry)
+
+    with open(_SAVED_FILE, "w", encoding="utf-8") as f:
+        _json.dump(projects, f, ensure_ascii=False, indent=2)
+
+    return {"status": "ok", "id": entry["id"]}
+
+
+@app.get("/saved-projects")
+async def get_saved_projects():
+    import json as _json
+
+    if not os.path.exists(_SAVED_FILE):
+        return []
+    try:
+        with open(_SAVED_FILE, "r", encoding="utf-8") as f:
+            projects = _json.load(f)
+        return [
+            {
+                "id":           p.get("id"),
+                "name":         p.get("name"),
+                "filename":     p.get("filename", ""),
+                "scale":        p.get("scale", ""),
+                "member_count": p.get("member_count", 0),
+                "page_count":   p.get("page_count", 1),
+                "created_at":   p.get("created_at", ""),
+            }
+            for p in projects
+        ]
+    except Exception:
+        return []
 
 
 if __name__ == "__main__":
