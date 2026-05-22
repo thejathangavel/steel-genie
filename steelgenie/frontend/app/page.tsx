@@ -93,6 +93,8 @@ export default function Home() {
   const [pdfImage, setPdfImage]           = useState<string | null>(null);
   const [filename, setFilename]           = useState("");
   const [pageCount, setPageCount]         = useState(0);
+  const [pageThumbnails, setPageThumbnails] = useState<string[]>([]);
+  const [selectedPageIndex, setSelectedPageIndex] = useState(0);
   const [uploading, setUploading]         = useState(false);
   const [uploadStage, setUploadStage]     = useState<"sending"|"processing"|null>(null);
   const [dragging, setDragging]           = useState(false);
@@ -128,7 +130,6 @@ export default function Home() {
 
   // ── MULTI-PAGE ────────────────────────────────────────────────────────────
   const [currentPageIdx, setCurrentPageIdx]   = useState(0);
-  const [pageThumbnails, setPageThumbnails]   = useState<string[]>([]);
   const [pageImageCache, setPageImageCache]   = useState<Record<number, string>>({});
   const [pageDataCache, setPageDataCache]     = useState<Record<number, {
     members: Member[]; summary: Summary | null; status: "not_set" | "estimating" | "built";
@@ -319,6 +320,8 @@ export default function Home() {
       setPdfImage(data.image);
       setFilename(data.filename);
       setPageCount(data.page_count);
+      setPageThumbnails(data.thumbnails || [data.image]);
+      setSelectedPageIndex(0);
       setStatus("not_set");
       setMembers([]);
       setBaseSummary(null);
@@ -503,6 +506,7 @@ export default function Home() {
 
   function handleReset() {
     setPdfImage(null); setFilename(""); setPageCount(0);
+    setPageThumbnails([]); setSelectedPageIndex(0);
     setStatus("not_set"); setMembers([]); setBaseSummary(null);
     setSelectedScale(null); setSelectedRatio(null);
     setToast(null); setZoomLevel(1); setContextMenu(null);

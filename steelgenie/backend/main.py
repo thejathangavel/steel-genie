@@ -167,29 +167,33 @@ def detect_beam_lines(page, profiles: list, plan_bounds: tuple) -> dict:
 
     Strategy
     --------
-    1. Collect all line segments inside the plan boundary that are:
-       • 30–600 pt long  (≈ 3-66 ft at 1/8" scale; excludes ticks and grid lines)
-       • Clearly horizontal  (dx > dy × 2)  or vertical  (dy > dx × 2)
-    2. For each profile label (cx, cy):
-       • H-match: label Y is within LABEL_R of a line's Y, AND
-                  label X falls inside the line's X span ± LABEL_R
-       • V-match: label X is within LABEL_R of a line's X, AND
-                  label Y falls inside the line's Y span ± LABEL_R
-       • Accept the closest single match (H or V).
+    1. Collect ALL line segments inside the plan boundary that are 30–650 pt long
+       (any angle — H, V, or diagonal).  Diagonal beams appear in irregular
+       framing plans (e.g. Area B skewed grids) and must not be excluded.
+    2. For each profile label (cx, cy) find the closest line using perpendicular
+       distance: project the label onto the infinite extension of each line and
+       measure the distance to the closest point on the segment (±15 % extension
+       so labels near span ends still match).  Accept if distance < LABEL_R.
     3. Return a dict  { profile_idx: {"x1","y1","x2","y2","dir","length_pt"} }
        for every profile that was successfully matched to a drawn line.
+       dir is "H" / "V" / "D" (diagonal).
        Unmatched profiles fall back to the grid-based span calculation.
 
     This gives us EXACT endpoints and EXACT length from the drawing geometry —
     no grid guessing needed.
     """
     bx0, by0, bx1, by1 = plan_bounds
+<<<<<<< Updated upstream
     MIN_LEN  = 30    # ignore dimension ticks (<3 ft at 1/8")
     MAX_LEN  = 1200  # raised: covers very long bays and 1/16" scale drawings
     LABEL_R  = 70    # raised: labels on dense drawings can sit further from centreline
+=======
+    MIN_LEN  = 45    # ignore ticks and very short annotation lines
+    MAX_LEN  = 650   # ignore full-plan grid border lines
+    LABEL_R  = 30    # max perpendicular distance from label to beam axis
+>>>>>>> Stashed changes
 
-    h_lines: list[tuple] = []   # (lx1, ly, lx2, ly, length)
-    v_lines: list[tuple] = []   # (lx, ly1, lx, ly2, length)
+    all_lines: list[tuple] = []   # (x1, y1, x2, y2, length)
 
     try:
         for d in page.get_drawings():
@@ -208,72 +212,101 @@ def detect_beam_lines(page, profiles: list, plan_bounds: tuple) -> dict:
                     # Midpoint must be inside plan boundary
                     if not (bx0 <= mx <= bx1 and by0 <= my <= by1):
                         continue
+<<<<<<< Updated upstream
                     # FIX: BOTH endpoints must also stay within plan bounds
                     # (with a small tolerance).  This prevents long annotation/
                     # dimension lines whose midpoint barely falls inside the plan
                     # from extending far into the notes or title block area.
                     _EP_TOL = 80   # ≈ 1.1" — proportional to widened plan boundary buffer
+=======
+                    # Both endpoints must stay within plan bounds (with tolerance).
+                    _EP_TOL = 50   # ≈ 0.7" — covers label offsets & small overruns
+>>>>>>> Stashed changes
                     if (min(p1.x, p2.x) < bx0 - _EP_TOL or
                             max(p1.x, p2.x) > bx1 + _EP_TOL):
                         continue
                     if (min(p1.y, p2.y) < by0 - _EP_TOL or
                             max(p1.y, p2.y) > by1 + _EP_TOL):
                         continue
-                    if dx > dy * 2:
-                        # Horizontal line: store as (x_start, y, x_end, y, len)
-                        h_lines.append((min(p1.x, p2.x), my,
-                                        max(p1.x, p2.x), my, ln))
-                    elif dy > dx * 2:
-                        # Vertical line: store as (x, y_start, x, y_end, len)
-                        v_lines.append((mx, min(p1.y, p2.y),
-                                        mx, max(p1.y, p2.y), ln))
+                    # Accept at any angle — H, V, or diagonal
+                    all_lines.append((p1.x, p1.y, p2.x, p2.y, ln))
                 except Exception:
                     continue
     except Exception:
         pass
 
-    print(f"[BEAM_LINES] H structural lines: {len(h_lines)}  "
-          f"V structural lines: {len(v_lines)}")
+    h_c = sum(1 for (x1,y1,x2,y2,ln) in all_lines if abs(x2-x1) > abs(y2-y1)*2)
+    v_c = sum(1 for (x1,y1,x2,y2,ln) in all_lines if abs(y2-y1) > abs(x2-x1)*2)
+    print(f"[BEAM_LINES] H:{h_c}  V:{v_c}  Diagonal:{len(all_lines)-h_c-v_c}  "
+          f"Total:{len(all_lines)}")
 
     result: dict[int, dict] = {}
 
     for p_idx, p in enumerate(profiles):
         pcx, pcy = p["cx"], p["cy"]
         best:   tuple | None = None
-        best_d: float        = float("inf")
-        best_dir: str        = "H"
+        best_score: float = -1.0   # higher = better
 
-        # ── Try to match a horizontal line ────────────────────────────────
-        for (lx1, ly, lx2, _, ln) in h_lines:
-            dy_label = abs(pcy - ly)
-            if dy_label > LABEL_R:
-                continue
-            if pcx < lx1 - LABEL_R or pcx > lx2 + LABEL_R:
-                continue
-            # Score = perpendicular distance from label to line axis
-            if dy_label < best_d:
-                best_d   = dy_label
-                best     = (lx1, ly, lx2, ly, ln)
-                best_dir = "H"
+        # Label orientation derived from text bounding box aspect ratio.
+        # Wide text (bbox_w >> bbox_h) → H-type beam; tall text → V-type beam.
+        lbw = p.get("bbox_w", 20.0)
+        lbh = p.get("bbox_h",  8.0)
+        label_is_h = lbw > lbh * 1.5
+        label_is_v = lbh > lbw * 1.5
 
-        # ── Try to match a vertical line ──────────────────────────────────
-        for (lx, ly1, _, ly2, ln) in v_lines:
-            dx_label = abs(pcx - lx)
-            if dx_label > LABEL_R:
+        for (lx1, ly1, lx2, ly2, ln) in all_lines:
+            ldx = lx2 - lx1
+            ldy = ly2 - ly1
+            adx = abs(ldx)
+            ady = abs(ldy)
+
+            # Direction guard — skip perpendicular lines
+            if label_is_h and ady > adx * 1.5:
                 continue
-            if pcy < ly1 - LABEL_R or pcy > ly2 + LABEL_R:
+            if label_is_v and adx > ady * 1.5:
                 continue
-            if dx_label < best_d:
-                best_d   = dx_label
-                best     = (lx, ly1, lx, ly2, ln)
-                best_dir = "V"
+
+            # Parametric projection onto line segment
+            t = ((pcx - lx1) * ldx + (pcy - ly1) * ldy) / (ln * ln)
+            # Allow ±10 % extension for labels near span ends
+            if t < -0.10 or t > 1.10:
+                continue
+            t_c = max(0.0, min(1.0, t))
+            px_proj = lx1 + t_c * ldx
+            py_proj = ly1 + t_c * ldy
+            dist = math.hypot(pcx - px_proj, pcy - py_proj)
+            if dist >= LABEL_R:
+                continue
+
+            # ── Composite score ───────────────────────────────────────────
+            # The beam label is placed ON the beam centreline near mid-span.
+            # A column-grid segment that merely passes close to the label
+            # will have the label at an off-centre t (not t≈0.5).
+            # Score = (proximity) × (midpoint closeness)
+            # This beats length weighting which falsely rewarded long grid
+            # segments over shorter but more central beam lines.
+            proximity  = 1.0 - dist / LABEL_R           # 0→1, higher = closer
+            t_center   = 1.0 - 2.0 * abs(t_c - 0.5)    # 0→1, 1=midpoint
+            score = proximity * t_center
+            if score > best_score:
+                best_score = score
+                best       = (lx1, ly1, lx2, ly2, ln)
 
         if best:
+            lx1, ly1, lx2, ly2, ln = best
+            adx = abs(lx2 - lx1)
+            ady = abs(ly2 - ly1)
+            if adx > ady * 2:
+                bdir = "H"
+            elif ady > adx * 2:
+                bdir = "V"
+            else:
+                bdir = "D"   # diagonal beam
             result[p_idx] = {
-                "x1": best[0], "y1": best[1],
-                "x2": best[2], "y2": best[3],
-                "dir":       best_dir,
-                "length_pt": best[4],
+                "x1": lx1, "y1": ly1,
+                "x2": lx2, "y2": ly2,
+                "dir":       bdir,
+                "length_pt": ln,
             }
 
     matched = len(result)
@@ -876,6 +909,212 @@ def detect_column_symbols(page):
     return symbols
 
 
+def detect_raster_grid_lines(img_path: str, plan_bounds: tuple) -> tuple:
+    """
+    Detect structural column grid lines from a raster image file.
+
+    Uses morphological opening with long kernels:
+      • Vertical kernel (height ≥ 40% of plan)  → isolates tall vertical lines
+        → their X positions become v_grid
+      • Horizontal kernel (width ≥ 40% of plan) → isolates wide horizontal lines
+        → their Y positions become h_grid
+
+    Structural column lines span the full plan height/width; beam centerlines,
+    annotation lines, and other short marks are suppressed.
+    """
+    try:
+        import cv2 as _cv2
+        from PIL import Image as _PIL
+    except ImportError:
+        return [], []
+
+    try:
+        pil = _PIL.open(img_path).convert("RGB")
+        img_arr = np.array(pil)
+    except Exception:
+        return [], []
+
+    bx0, by0, bx1, by1 = [int(round(x)) for x in plan_bounds]
+    bx0 = max(bx0, 0); by0 = max(by0, 0)
+    bx1 = min(bx1, img_arr.shape[1]); by1 = min(by1, img_arr.shape[0])
+    H = by1 - by0; W = bx1 - bx0
+    if H < 50 or W < 50:
+        return [], []
+
+    region = img_arr[by0:by1, bx0:bx1]
+    gray = _cv2.cvtColor(region, _cv2.COLOR_RGB2GRAY)
+    # Invert: dark structural lines → white in binary
+    _, binary = _cv2.threshold(gray, 200, 255, _cv2.THRESH_BINARY_INV)
+
+    def _cluster_avg(vals: list, tol: float = 12.0) -> list:
+        """Merge nearby positions by averaging each cluster."""
+        if not vals:
+            return []
+        result = []
+        group = [vals[0]]
+        for v in sorted(vals)[1:]:
+            if v - group[-1] <= tol:
+                group.append(v)
+            else:
+                result.append(sum(group) / len(group))
+                group = [v]
+        result.append(sum(group) / len(group))
+        return result
+
+    # ── Vertical grid lines (column lines running top→bottom) ──────────────
+    v_klen = max(30, int(H * 0.40))
+    v_kernel = _cv2.getStructuringElement(_cv2.MORPH_RECT, (1, v_klen))
+    v_img = _cv2.morphologyEx(binary, _cv2.MORPH_OPEN, v_kernel)
+    v_sums = np.sum(v_img, axis=0).astype(float) / 255
+    v_threshold = H * 0.25
+    raw_vx = [float(x + bx0) for x in range(W) if v_sums[x] >= v_threshold]
+    v_grid = _cluster_avg(raw_vx, tol=15)
+
+    # ── Horizontal grid lines (row lines running left→right) ───────────────
+    h_klen = max(30, int(W * 0.40))
+    h_kernel = _cv2.getStructuringElement(_cv2.MORPH_RECT, (h_klen, 1))
+    h_img = _cv2.morphologyEx(binary, _cv2.MORPH_OPEN, h_kernel)
+    h_sums = np.sum(h_img, axis=1).astype(float) / 255
+    h_threshold = W * 0.25
+    raw_hy = [float(y + by0) for y in range(H) if h_sums[y] >= h_threshold]
+    h_grid = _cluster_avg(raw_hy, tol=15)
+
+    print(f"[RASTER_GRID] V({len(v_grid)}): {[round(x) for x in v_grid]}")
+    print(f"[RASTER_GRID] H({len(h_grid)}): {[round(y) for y in h_grid]}")
+    return v_grid, h_grid
+
+
+def detect_beam_lines_raster(img_path: str, profiles: list,
+                             plan_bounds: tuple,
+                             span_v_grid: list = None,
+                             span_h_grid: list = None) -> dict:
+    """
+    Raster equivalent of detect_beam_lines for vector PDFs.
+
+    Uses actual drawn Hough line segments as span endpoints — each beam gets
+    exactly the length of its drawn line in the image, just like vector PDF
+    mode reads CAD geometry.
+
+    Max-span cap is derived dynamically from the column-bay widths so that
+    full-plan column-grid lines and sheet borders are always excluded.
+
+    Returns { profile_idx: {"x1","y1","x2","y2","dir","length_pt"} }
+    """
+    try:
+        import cv2 as _cv2
+        from PIL import Image as _PIL
+    except ImportError:
+        return {}
+
+    try:
+        pil = _PIL.open(img_path).convert("L")
+        img_gray = np.array(pil)
+    except Exception:
+        return {}
+
+    bx0, by0, bx1, by1 = [int(round(x)) for x in plan_bounds]
+    bx0 = max(bx0, 0); by0 = max(by0, 0)
+    bx1 = min(bx1, img_gray.shape[1]); by1 = min(by1, img_gray.shape[0])
+    plan_w = bx1 - bx0; plan_h = by1 - by0
+    if plan_w < 50 or plan_h < 50:
+        return {}
+
+    # Derive dynamic max-span from bay widths so column/border lines are excluded.
+    # Cap = 1.4× the widest detected structural bay (allows slight overrun).
+    vg = span_v_grid or []
+    hg = span_h_grid or []
+
+    if len(vg) >= 2:
+        max_bay_w = max(b - a for a, b in zip(sorted(vg), sorted(vg)[1:]))
+        MAX_H = max_bay_w * 1.4
+    else:
+        MAX_H = plan_w * 0.45
+
+    if len(hg) >= 2:
+        max_bay_h = max(b - a for a, b in zip(sorted(hg), sorted(hg)[1:]))
+        MAX_V = max_bay_h * 1.4
+    else:
+        MAX_V = plan_h * 0.45
+
+    region = img_gray[by0:by1, bx0:bx1]
+    edges = _cv2.Canny(region, threshold1=50, threshold2=150, apertureSize=3)
+    raw = _cv2.HoughLinesP(
+        edges,
+        rho=1, theta=np.pi / 180,
+        threshold=25,
+        minLineLength=45,
+        maxLineGap=6,          # small gap: don't bridge across column locations
+    )
+    if raw is None:
+        return {}
+
+    DIR_R   = 2.5
+    LABEL_R = 30    # px — search radius around label
+    MIN_LEN = 45
+
+    h_lines: list[tuple] = []   # (x1, y, x2, y, length)
+    v_lines: list[tuple] = []   # (x, y1, x, y2, length)
+
+    for seg in raw:
+        x1r, y1r, x2r, y2r = seg[0]
+        x1 = float(x1r + bx0); y1 = float(y1r + by0)
+        x2 = float(x2r + bx0); y2 = float(y2r + by0)
+        dx = abs(x2 - x1); dy = abs(y2 - y1)
+        ln = math.hypot(dx, dy)
+        if ln < MIN_LEN:
+            continue
+        if dx > dy * DIR_R and ln <= MAX_H:
+            my = (y1 + y2) / 2
+            h_lines.append((min(x1, x2), my, max(x1, x2), my, ln))
+        elif dy > dx * DIR_R and ln <= MAX_V:
+            mx = (x1 + x2) / 2
+            v_lines.append((mx, min(y1, y2), mx, max(y1, y2), ln))
+
+    print(f"[RASTER_BEAM] MAX_H={MAX_H:.0f}px MAX_V={MAX_V:.0f}px  "
+          f"H lines: {len(h_lines)}  V lines: {len(v_lines)}")
+
+    result: dict = {}
+    for p_idx, p in enumerate(profiles):
+        pcx, pcy = p["cx"], p["cy"]
+        best = None; best_d = float("inf"); best_dir = "H"
+
+        # Prefer longer lines when equidistant (longer = more likely real beam)
+        for (lx1, ly, lx2, _, ln) in h_lines:
+            dy_l = abs(pcy - ly)
+            if dy_l > LABEL_R:
+                continue
+            if pcx < lx1 - LABEL_R or pcx > lx2 + LABEL_R:
+                continue
+            score = dy_l - ln * 0.01   # slight length bonus
+            if score < best_d:
+                best_d = score
+                best = (lx1, ly, lx2, ly, ln)
+                best_dir = "H"
+
+        for (lx, ly1, _, ly2, ln) in v_lines:
+            dx_l = abs(pcx - lx)
+            if dx_l > LABEL_R:
+                continue
+            if pcy < ly1 - LABEL_R or pcy > ly2 + LABEL_R:
+                continue
+            score = dx_l - ln * 0.01
+            if score < best_d:
+                best_d = score
+                best = (lx, ly1, lx, ly2, ln)
+                best_dir = "V"
+
+        if best:
+            result[p_idx] = {
+                "x1": best[0], "y1": best[1],
+                "x2": best[2], "y2": best[3],
+                "dir": best_dir,
+                "length_pt": best[4],
+            }
+
+    print(f"[RASTER_BEAM] {len(result)}/{len(profiles)} profiles matched")
+    return result
+
+
 # ── Grid line extraction ──────────────────────────────────────────────────────
 def extract_grid_lines(page, page_w, page_h, plan_bounds, text_dict=None):
     """
@@ -901,7 +1140,17 @@ def extract_grid_lines(page, page_w, page_h, plan_bounds, text_dict=None):
     """
     bx0, by0, bx1, by1 = plan_bounds
 
-    # Collect positions of each label family inside the plan boundary
+    # Collect positions of each label family inside the plan boundary.
+    #
+    # We only trust labels that sit near the PERIMETER of the plan (outer 25%).
+    # Grid bubbles are always at the top/bottom/left/right edge — never in the
+    # interior.  Interior annotation numbers (joist loads "18K" OCR'd as "18",
+    # span callouts "22", etc.) would otherwise pollute v_grid / h_grid and
+    # make every beam span collapse to near-zero length.
+    plan_w = max(bx1 - bx0, 1.0)
+    plan_h = max(by1 - by0, 1.0)
+    EDGE   = 0.25   # outer 25% of plan in each axis
+
     letter_pts: list[tuple[float, float]] = []
     number_pts: list[tuple[float, float]] = []
 
@@ -918,6 +1167,13 @@ def extract_grid_lines(page, page_w, page_h, plan_bounds, text_dict=None):
                 # Must be inside (or very close to) the plan boundary
                 if not (bx0 - 60 <= cx <= bx1 + 60 and
                         by0 - 60 <= cy <= by1 + 60):
+                    continue
+                # Must be near the perimeter — grid bubbles are always at the edge
+                near_edge = (
+                    cx < bx0 + plan_w * EDGE or cx > bx1 - plan_w * EDGE or
+                    cy < by0 + plan_h * EDGE or cy > by1 - plan_h * EDGE
+                )
+                if not near_edge:
                     continue
 
                 if _GRID_LETTER.match(t):
@@ -1143,7 +1399,7 @@ def extract_profiles(page, page_w, page_h, plan_bounds, text_dict=None):
     excluded_zones = detect_schedule_zones(page, plan_bounds, text_dict=text_dict)
     profiles, seen = [], []
 
-    def _try_add(text, cx, cy, rot_pass=0):
+    def _try_add(text, cx, cy, rot_pass=0, bbox_w=20.0, bbox_h=8.0):
         if not text:
             return
         if not (bx0 <= cx <= bx1 and by0 <= cy <= by1):
@@ -1162,6 +1418,10 @@ def extract_profiles(page, page_w, page_h, plan_bounds, text_dict=None):
                         "cx": cx, "cy": cy,
                         # dir_hint: passes 1 & 2 found rotated (vertical) labels
                         "dir_hint": "V" if rot_pass in (1, 2) else "H",
+                        # bbox dimensions — used by detect_beam_lines to infer
+                        # expected beam direction (wide text → H beam; tall → V)
+                        "bbox_w": max(bbox_w, 1.0),
+                        "bbox_h": max(bbox_h, 1.0),
                     })
                 break
 
@@ -1176,21 +1436,122 @@ def extract_profiles(page, page_w, page_h, plan_bounds, text_dict=None):
                 cx = (bbox[0] + bbox[2]) / 2
                 cy = (bbox[1] + bbox[3]) / 2
                 _try_add(span["text"].strip(), cx, cy,
-                         rot_pass=span.get("rot_pass", 0))
+                         rot_pass=span.get("rot_pass", 0),
+                         bbox_w=bbox[2] - bbox[0],
+                         bbox_h=bbox[3] - bbox[1])
 
             # ── Line-level: join all spans → catches "W18" + "X40" splits ─
-            # Use the rotation pass of the first span (all spans in one line
-            # come from the same OCR pass in the raster path).
             line_text = "".join(s["text"] for s in spans).strip()
             if line.get("bbox") and line_text:
                 lb = line["bbox"]
                 lx = (lb[0] + lb[2]) / 2
                 ly = (lb[1] + lb[3]) / 2
                 first_pass = spans[0].get("rot_pass", 0) if spans else 0
-                _try_add(line_text, lx, ly, rot_pass=first_pass)
+                _try_add(line_text, lx, ly, rot_pass=first_pass,
+                         bbox_w=lb[2] - lb[0], bbox_h=lb[3] - lb[1])
 
     print(f"[EXTRACT] {len(profiles)} profiles found in plan")
     return profiles
+
+
+def precompute_span_grids(profiles: list, plan_bounds: tuple,
+                          page_w: float, page_h: float) -> tuple:
+    """
+    Quick pre-pass: classify profiles without grid context to find columns,
+    then build span grids from their positions.
+
+    Used by the /analyse endpoint to generate reliable span grids BEFORE
+    detect_beam_lines_raster and build_members are called, so both can use
+    the same accurate column-position-based grids.
+
+    Returns (span_v_grid, span_h_grid) as sorted lists of pixel positions.
+    """
+    _pb = plan_bounds or (0, 0, page_w, page_h)
+
+    col_xs: list[float] = []
+    col_ys: list[float] = []
+    for p in profiles:
+        mt = classify_member(p["profile"], p["cx"], p["cy"],
+                             column_symbols=None, v_grid=None, h_grid=None)
+        if mt == "column":
+            col_xs.append(p["cx"])
+            col_ys.append(p["cy"])
+
+    def _dedup(vals: list, tol: float = 20.0) -> list:
+        out: list = []
+        for v in sorted(vals):
+            if not out or abs(v - out[-1]) > tol:
+                out.append(v)
+        return out
+
+    svg = _dedup(col_xs) if col_xs else []
+    shg = _dedup(col_ys) if col_ys else []
+
+    # Always include plan-boundary edges so edge beams get a span line
+    svg = _dedup(sorted(svg + [_pb[0], _pb[2]]))
+    shg = _dedup(sorted(shg + [_pb[1], _pb[3]]))
+
+    print(f"[SPAN_GRIDS] V({len(svg)}): {[round(x) for x in svg]}")
+    print(f"[SPAN_GRIDS] H({len(shg)}): {[round(y) for y in shg]}")
+    return svg, shg
+
+
+def _snap_endpoint_to_column(x: float, y: float,
+                              column_symbols: list,
+                              snap_radius: float = 90.0) -> tuple[float, float]:
+    """Return the position of the nearest column symbol within snap_radius."""
+    if not column_symbols:
+        return x, y
+    best = min(column_symbols, key=lambda s: math.hypot(s["cx"] - x, s["cy"] - y))
+    if math.hypot(best["cx"] - x, best["cy"] - y) <= snap_radius:
+        return best["cx"], best["cy"]
+    return x, y
+
+
+def _column_pair_span(cx: float, cy: float, beam_dir: str,
+                      column_symbols: list, pts_per_foot: float,
+                      max_span_pt: float = 380.0) -> dict | None:
+    """
+    Find the two nearest column symbols that a beam label sits BETWEEN and
+    return span endpoints (exact column-to-column positions).
+
+    max_span_pt caps the result so multi-bay false matches are rejected.
+    At 1/8"=1'-0" scale, 380 pt ≈ 42 ft — typical max single bay.
+    """
+    if not column_symbols:
+        return None
+
+    if beam_dir in ("H", "D"):
+        for tol in (25, 50, 80):
+            row    = [s for s in column_symbols if abs(s["cy"] - cy) <= tol]
+            lefts  = [s for s in row if s["cx"] < cx - 5]
+            rights = [s for s in row if s["cx"] > cx + 5]
+            if lefts and rights:
+                c1 = max(lefts,  key=lambda s: s["cx"])
+                c2 = min(rights, key=lambda s: s["cx"])
+                break
+        else:
+            return None
+    else:  # V
+        for tol in (25, 50, 80):
+            col     = [s for s in column_symbols if abs(s["cx"] - cx) <= tol]
+            tops    = [s for s in col if s["cy"] < cy - 5]
+            bottoms = [s for s in col if s["cy"] > cy + 5]
+            if tops and bottoms:
+                c1 = max(tops,    key=lambda s: s["cy"])
+                c2 = min(bottoms, key=lambda s: s["cy"])
+                break
+        else:
+            return None
+
+    length_pt = math.hypot(c2["cx"] - c1["cx"], c2["cy"] - c1["cy"])
+    if length_pt > max_span_pt:
+        return None  # multi-bay false match — let grid fallback handle it
+    return {
+        "x1": c1["cx"], "y1": c1["cy"],
+        "x2": c2["cx"], "y2": c2["cy"],
+        "length_ft": round(length_pt / pts_per_foot, 1) if pts_per_foot > 0 else 0.0,
+    }
 
 
 # ── Build members + summary ───────────────────────────────────────────────────
@@ -1282,6 +1643,71 @@ def build_members(profiles, page_w, page_h,
         print(f"[BUILD] {len(symbol_matched_cols)} profiles matched to column symbols "
               f"(of {len(column_symbols)} symbols, {len(profiles)} profiles)")
 
+    # ── Span grids: build reliable v/h grids for beam span computation ────────
+    # Text-label grid detection is noisy for raster images (dense false
+    # positives near the plan perimeter → tiny spans).  Column X positions are
+    # far more reliable: every column sits at a real grid intersection.
+    #
+    # Strategy:
+    #  1. Quick-classify all profiles to find columns (no symbol/grid context).
+    #  2. If the text-derived v_grid is too dense (min spacing < 40 units, which
+    #     is ~4 ft at 1/8" scale — physically impossible for structural steel),
+    #     replace it with the sorted column X positions.
+    #  3. Same for h_grid using column Y positions.
+    #  4. If still empty after column fallback, use plan-boundary or page extremes
+    #     so every beam at least gets a full-width/full-height line.
+
+    pre_col_xs: list[float] = []
+    pre_col_ys: list[float] = []
+    for p_idx, p in enumerate(profiles):
+        if p_idx in symbol_matched_cols:
+            pre_col_xs.append(p["cx"])
+            pre_col_ys.append(p["cy"])
+        else:
+            mt = classify_member(p["profile"], p["cx"], p["cy"],
+                                 column_symbols=None, v_grid=None, h_grid=None)
+            if mt == "column":
+                pre_col_xs.append(p["cx"])
+                pre_col_ys.append(p["cy"])
+
+    def _dedup(vals: list[float], tol: float = 18) -> list[float]:
+        out: list[float] = []
+        for v in sorted(vals):
+            if not out or abs(v - out[-1]) > tol:
+                out.append(v)
+        return out
+
+    def _grid_too_dense(grid: list, span: float, min_gap: float = 40.0) -> bool:
+        """True when the grid has very closely-spaced entries (false positives)."""
+        if len(grid) < 2:
+            return False
+        gaps = [b - a for a, b in zip(sorted(grid), sorted(grid)[1:])]
+        return min(gaps) < min_gap
+
+    # Build effective span grids
+    _pb = plan_bounds or (0, 0, page_w, page_h)
+    span_v_grid = v_grid or []
+    span_h_grid = h_grid or []
+
+    if _grid_too_dense(span_v_grid, page_w) or not span_v_grid:
+        span_v_grid = _dedup(pre_col_xs, tol=20) if pre_col_xs else []
+    if _grid_too_dense(span_h_grid, page_h) or not span_h_grid:
+        span_h_grid = _dedup(pre_col_ys, tol=20) if pre_col_ys else []
+
+    # Always include plan-boundary edges so beams beyond the last column
+    # still get a line (left/right or top/bottom of the plan becomes one endpoint).
+    if not span_v_grid:
+        span_v_grid = [_pb[0], _pb[2]]
+    else:
+        span_v_grid = _dedup(sorted(span_v_grid + [_pb[0], _pb[2]]), tol=20)
+    if not span_h_grid:
+        span_h_grid = [_pb[1], _pb[3]]
+    else:
+        span_h_grid = _dedup(sorted(span_h_grid + [_pb[1], _pb[3]]), tol=20)
+
+    print(f"[BUILD] span_v_grid({len(span_v_grid)}): {[round(x) for x in span_v_grid]}")
+    print(f"[BUILD] span_h_grid({len(span_h_grid)}): {[round(y) for y in span_h_grid]}")
+
     # ── Pass 2: classify + snap ───────────────────────────────────────────────
     claimed_symbols: set[int] = set()
 
@@ -1339,6 +1765,7 @@ def build_members(profiles, page_w, page_h,
             ly_frac = p["cy"] / page_h
 
             if line_hit:
+<<<<<<< Updated upstream
                 # ── PRIMARY: trust the drawn vector line unconditionally ────
                 #
                 # detect_beam_lines() extracts PDF vector geometry — the line
@@ -1441,6 +1868,80 @@ def build_members(profiles, page_w, page_h,
                               f"(label=({lx_frac:.3f},{ly_frac:.3f}) "
                               f"span=({_bx1:.3f},{_by1:.3f})→({_bx2:.3f},{_by2:.3f})"
                               f" dir={beam_dir})")
+=======
+                # ── PRIMARY: vector line match ───────────────────────────────
+                beam_dir = line_hit["dir"]
+                ex1, ey1 = line_hit["x1"], line_hit["y1"]
+                ex2, ey2 = line_hit["x2"], line_hit["y2"]
+
+                # Snap endpoints to actual column symbol positions so the
+                # overlay line follows the true column-to-column geometry when
+                # the CAD beam line is axis-aligned but the grid is skewed.
+                # 30 pt ≈ 0.4″ — tight enough to avoid grabbing adjacent columns.
+                if column_symbols:
+                    sx1, sy1 = _snap_endpoint_to_column(ex1, ey1, column_symbols, 30)
+                    sx2, sy2 = _snap_endpoint_to_column(ex2, ey2, column_symbols, 30)
+                    snapped_len = math.hypot(sx1 - sx2, sy1 - sy2)
+                    orig_len    = math.hypot(ex1 - ex2, ey1 - ey2)
+                    # Only accept snap if:
+                    #  • both ends moved to distinct positions
+                    #  • snapped length is within 30 % of original (no multi-bay jump)
+                    if snapped_len > 20 and 0.70 * orig_len <= snapped_len <= 1.30 * orig_len:
+                        ex1, ey1 = sx1, sy1
+                        ex2, ey2 = sx2, sy2
+
+                # If line is still axis-aligned (perfectly H or V) after
+                # snapping, the CAD centreline didn't encode the true skewed
+                # geometry.  Try column-pair correction: find the adjacent
+                # columns in the beam direction and use their exact positions
+                # so the overlay follows the real column-to-column angle.
+                still_hv = (abs(ex2 - ex1) < 2 or abs(ey2 - ey1) < 2)
+                if still_hv and column_symbols:
+                    cp = _column_pair_span(
+                        p["cx"], p["cy"], beam_dir,
+                        column_symbols, pts_per_foot)
+                    if cp:
+                        ex1, ey1 = cp["x1"], cp["y1"]
+                        ex2, ey2 = cp["x2"], cp["y2"]
+
+                length_pt = math.hypot(ex2 - ex1, ey2 - ey1)
+                length_ft = round(length_pt / pts_per_foot, 1) if pts_per_foot > 0 else 0.0
+                bx1 = round(ex1 / page_w, 4)
+                by1 = round(ey1 / page_h, 4)
+                bx2 = round(ex2 / page_w, 4)
+                by2 = round(ey2 / page_h, 4)
+                render_cx = (ex1 + ex2) / 2
+                render_cy = (ey1 + ey2) / 2
+
+            else:
+                # ── FALLBACK 1: column-pair span ─────────────────────────────
+                # Use actual column symbol positions → exact column-to-column
+                # line that handles diagonal grids naturally.
+                beam_dir = ((beam_dirs or {}).get(p_idx)
+                            or p.get("dir_hint", "H"))
+                span = _column_pair_span(
+                    p["cx"], p["cy"], beam_dir, column_symbols, pts_per_foot)
+
+                # ── FALLBACK 2: grid-based approximation ─────────────────────
+                if span is None:
+                    _need_v = (beam_dir == "H")
+                    _need_h = (beam_dir == "V")
+                    _can_span = (_need_v and span_v_grid) or (_need_h and span_h_grid)
+                    if _can_span:
+                        span = compute_beam_span(
+                            p["cx"], p["cy"], span_v_grid, span_h_grid,
+                            pts_per_foot, beam_dir,
+                        )
+
+                if span:
+                    length_ft = span["length_ft"]
+                    bx1 = round(span["x1"] / page_w, 4)
+                    by1 = round(span["y1"] / page_h, 4)
+                    bx2 = round(span["x2"] / page_w, 4)
+                    by2 = round(span["y2"] / page_h, 4)
+                    render_cx = (span["x1"] + span["x2"]) / 2
+                    render_cy = (span["y1"] + span["y2"]) / 2
+>>>>>>> Stashed changes
 
         sym = profile_sym_pos.get(p_idx)
         members.append({
@@ -1513,6 +2014,28 @@ def health():
     return {"status": "ok", "supabase": supabase_client is not None}
 
 
+def _render_page_pil(file_path: str, page_index: int, max_width: int = 2800) -> PILImage.Image:
+    """Render a single PDF page (or image file) to a PIL image capped at max_width."""
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == ".pdf":
+        doc = fitz.open(file_path)
+        pix = doc[page_index].get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+        pil = PILImage.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        doc.close()
+    else:
+        pil = PILImage.open(file_path).convert("RGB")
+    if pil.width > max_width:
+        ratio = max_width / pil.width
+        pil = pil.resize((max_width, int(pil.height * ratio)), PILImage.LANCZOS)
+    return pil
+
+
+def _pil_to_b64(pil: PILImage.Image, quality: int = 85) -> str:
+    buf = io.BytesIO()
+    pil.save(buf, format="JPEG", quality=quality)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
     file_path = os.path.join(UPLOAD_DIR, file.filename)
@@ -1553,7 +2076,6 @@ async def upload_file(file: UploadFile = File(...)):
         doc.close()
         main_b64 = _render_page_to_b64(pil0, MAX_PREVIEW_W, 85, fmt="PNG")
     else:
-        pil = PILImage.open(file_path).convert("RGB")
         page_count = 1
         main_b64 = _render_page_to_b64(pil, MAX_PREVIEW_W, 85, fmt="PNG")
         page_thumbnails = [_render_page_to_b64(
@@ -1587,6 +2109,7 @@ async def get_page_image(filename: str, page_index: int):
             raise HTTPException(404, "Image files have only one page")
         pil = PILImage.open(file_path).convert("RGB")
 
+<<<<<<< Updated upstream
     MAX_PREVIEW_W = 2800
     if pil.width > MAX_PREVIEW_W:
         r = MAX_PREVIEW_W / pil.width
@@ -1595,6 +2118,46 @@ async def get_page_image(filename: str, page_index: int):
     pil.save(buf, format="PNG")
     b64 = base64.b64encode(buf.getvalue()).decode()
     return {"image": f"data:image/png;base64,{b64}", "page_index": page_index}
+=======
+    # Full-resolution preview for page 0 (shown in main canvas immediately)
+    pil0 = _render_page_pil(file_path, 0, max_width=2800)
+    main_image = _pil_to_b64(pil0, quality=85)
+
+    # Small thumbnails for every page (shown in the sidebar page picker)
+    THUMB_W = 300
+    thumbnails = []
+    for i in range(page_count):
+        pil_t = _render_page_pil(file_path, i, max_width=THUMB_W)
+        thumbnails.append(_pil_to_b64(pil_t, quality=70))
+
+    return {
+        "image":      main_image,
+        "width":      pil0.width,
+        "height":     pil0.height,
+        "page_count": page_count,
+        "filename":   file.filename,
+        "thumbnails": thumbnails,   # list of base64 JPEG per page
+    }
+
+
+class PageImageRequest(BaseModel):
+    filename:   str
+    page_index: int = 0
+
+@app.post("/page-image")
+async def get_page_image(req: PageImageRequest):
+    """Return the full-resolution preview image for a specific page."""
+    file_path = os.path.join(UPLOAD_DIR, req.filename)
+    if not os.path.exists(file_path):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="File not found")
+    pil = _render_page_pil(file_path, req.page_index, max_width=2800)
+    return {
+        "image":  _pil_to_b64(pil, quality=85),
+        "width":  pil.width,
+        "height": pil.height,
+    }
+>>>>>>> Stashed changes
 
 
 @app.post("/analyse")
@@ -1635,6 +2198,16 @@ async def analyse_pdf(req: AnalysisRequest):
         v_grid, h_grid = extract_grid_lines(page, page_w, page_h, plan_bounds,
                                             text_dict=text_dict)
 
+        # 3b. For raster images, replace text-derived grid with morphological
+        #     line detection: finds the actual drawn structural column lines
+        #     (long vertical/horizontal lines spanning ≥40% of the plan).
+        if is_raster and ext in _IMAGE_EXTS:
+            rv, rh = detect_raster_grid_lines(tmp_path, plan_bounds)
+            if rv:
+                v_grid = rv
+            if rh:
+                h_grid = rh
+
         # 4. Extract profile labels within the plan
         profiles = extract_profiles(page, page_w, page_h, plan_bounds,
                                     text_dict=text_dict)
@@ -1667,6 +2240,7 @@ async def analyse_pdf(req: AnalysisRequest):
         pts_per_foot = scale_to_pts_per_foot(req.scale_ratio) if req.scale_ratio else 0.0
         print(f"[ANALYSE] scale_ratio={req.scale_ratio}  pts_per_foot={pts_per_foot:.2f}")
 
+<<<<<<< Updated upstream
         # 6. PRIMARY: match beam centerlines to profile labels
         #    • Vector PDF: read page.get_drawings() — exact mathematical geometry.
         #    • Raster image: render to 300-DPI greyscale and run HoughLinesP.
@@ -1688,6 +2262,32 @@ async def analyse_pdf(req: AnalysisRequest):
                 {} if is_raster
                 else detect_beam_lines(page, profiles, plan_bounds)
             )
+=======
+        # 5b. For raster images, pre-compute reliable span grids from column
+        #     positions BEFORE beam-line matching, so both detect_beam_lines_raster
+        #     and build_members can use the same accurate column-based grids.
+        if is_raster:
+            raster_span_vg, raster_span_hg = precompute_span_grids(
+                profiles, plan_bounds, page_w, page_h)
+            # Replace noisy OCR-derived grids with column-position grids
+            v_grid = raster_span_vg
+            h_grid = raster_span_hg
+
+        # 6. PRIMARY: match vector beam lines
+        #    Vector PDFs: use PyMuPDF path geometry (exact CAD lines)
+        #    Raster images: use Hough line detection on the pixel image
+        #    Hough gives exact centerline Y/X; column grids give span endpoints.
+        if is_raster and ext in _IMAGE_EXTS:
+            beam_line_map = detect_beam_lines_raster(
+                tmp_path, profiles, plan_bounds,
+                span_v_grid=raster_span_vg,
+                span_h_grid=raster_span_hg,
+            )
+        elif is_raster:
+            beam_line_map = {}
+        else:
+            beam_line_map = detect_beam_lines(page, profiles, plan_bounds)
+>>>>>>> Stashed changes
 
         # 7. FALLBACK direction detection
         #    • Vector: use adjacent drawn lines via detect_beam_directions().
