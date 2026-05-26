@@ -1,5 +1,16 @@
 [
   {
+    "id": "6d2e9a38-a7ae-4bf5-a4a4-ced66bfecd42",
+    "name": "sfe",
+    "filename": "Structural snaps.pdf",
+    "scale": "1/8\" = 1'-0\"",
+    "scale_ratio": 96,
+    "members": [],
+    "member_count": 0,
+    "page_count": 8,
+    "created_at": "2026-05-25T08:28:02Z"
+  },
+  {
     "id": "bdebb5f1-e9f4-4530-a2c2-c21e8eb75391",
     "name": "steel",
     "filename": "Structural snaps.pdf",
