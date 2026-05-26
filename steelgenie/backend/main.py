@@ -69,6 +69,10 @@ STEEL_PATTERNS = [
     # The (?!\d) lookahead prevents matching partial OCR reads like "W16X3" from
     # "W16X31" or "W16X3128" (garbage from adjacent load annotations).
     r'W\d{1,2}[Xx]\d{2,3}(?!\d)',
+    # Abbreviated W-sections (depth only, no weight) — drawings that label beams
+    # as "W12", "W16" etc. without lbs/ft.  The negative lookaheads/lookbehinds
+    # prevent matching mid-word (e.g. "HSS10X8X3/8" or "W12X26").
+    r'(?<![A-Z0-9])W\d{1,2}(?![Xx\d])',
     r'HSS[\d.]+[Xx][\d.]+(?:[Xx][\d.]+(?:/[\d.]+)?)?',  # HSS6X6, HSS6X6X1/4, HSS7.00X0.50
     r'L\d+[Xx]\d+',
     r'C\d+[Xx]\d+',
@@ -156,7 +160,8 @@ def compute_beam_span(cx: float, cy: float,
     return None
 
 
-def detect_beam_lines(page, profiles: list, plan_bounds: tuple) -> dict:
+def detect_beam_lines(page, profiles: list, plan_bounds: tuple,
+                      pts_per_foot: float = 0.0) -> dict:
     """
     PRIMARY beam detection: find structural centerlines in the PDF vector drawing
     and match them to steel-section text labels.
@@ -183,20 +188,49 @@ def detect_beam_lines(page, profiles: list, plan_bounds: tuple) -> dict:
     no grid guessing needed.
     """
     bx0, by0, bx1, by1 = plan_bounds
-<<<<<<< Updated upstream
-    MIN_LEN  = 30    # ignore dimension ticks (<3 ft at 1/8")
-    MAX_LEN  = 1200  # raised: covers very long bays and 1/16" scale drawings
-    LABEL_R  = 70    # raised: labels on dense drawings can sit further from centreline
-=======
-    MIN_LEN  = 45    # ignore ticks and very short annotation lines
-    MAX_LEN  = 650   # ignore full-plan grid border lines
-    LABEL_R  = 30    # max perpendicular distance from label to beam axis
->>>>>>> Stashed changes
+    # MIN_LEN = 45 pt ≈ 5 ft at 1/8" scale.
+    # This filters two things:
+    #  1. Real ticks / arrowheads / hatch lines (always <30 pt)
+    #  2. Exploded dash segments — many CAD exporters draw dashed lines as
+    #     many short SOLID segments with gaps rather than a single path with
+    #     a PDF dash pattern.  Typical structural drawing dash lengths are
+    #     3–30 pt, so 45 pt cleanly separates them from beam centrelines.
+    MIN_LEN  = 45
+    # Cap at 80 ft using the drawing scale — prevents full-plan dimension/
+    # annotation lines from being matched as beam centrelines.
+    # Fall back to 700 pt (≈78 ft at 1/8") when scale is unknown.
+    MAX_LEN  = int(pts_per_foot * 80) if pts_per_foot > 0 else 700
+    LABEL_R  = 100   # wider: labels in dense drawings can be pushed 70-100 pt from centreline
 
     all_lines: list[tuple] = []   # (x1, y1, x2, y2, length)
 
     try:
         for d in page.get_drawings():
+            # ── Skip dashed / dotted paths ────────────────────────────────────
+            # Type A — PDF dash pattern: check that the bracket content of
+            #   d["dashes"] is empty.  A solid line is "" or "[] 0" (empty
+            #   bracket array).  Any content inside the brackets, e.g.
+            #   "[3 3] 0", "[0.5 1.5] 0", means dashed/dotted → skip.
+            #   Using regex on bracket content is more robust than exact-
+            #   string comparison, which would miss variants like "[] 0.0".
+            _dashes = (d.get("dashes") or "").strip()
+            _da = re.match(r'\[([^\]]*)\]', _dashes)
+            if _da and _da.group(1).strip():
+                continue   # non-empty bracket content → dashed line
+
+            # Type B — Exploded dashes: CAD draws each dash as a tiny SOLID
+            #   segment with a gap to the next.  No dash property is set.
+            #   Handled by MIN_LEN=45 (rejects segments shorter than ~5 ft).
+
+            # Type C — Thin construction / hidden lines that carry no dash
+            #   property but are drawn hairline-thin in CAD (lineweight ≤ 0.3 pt).
+            #   Structural beam centrelines always have a measurable weight.
+            #   Skip any path with an explicitly set width < 0.3 pt.
+            #   (Width = 0 or None means "default" in some exporters — keep those.)
+            _lw = d.get("width") or 0
+            if 0 < _lw < 0.3:
+                continue
+
             for item in d.get("items", []):
                 if item[0] != "l":
                     continue
@@ -212,16 +246,11 @@ def detect_beam_lines(page, profiles: list, plan_bounds: tuple) -> dict:
                     # Midpoint must be inside plan boundary
                     if not (bx0 <= mx <= bx1 and by0 <= my <= by1):
                         continue
-<<<<<<< Updated upstream
                     # FIX: BOTH endpoints must also stay within plan bounds
                     # (with a small tolerance).  This prevents long annotation/
                     # dimension lines whose midpoint barely falls inside the plan
                     # from extending far into the notes or title block area.
                     _EP_TOL = 80   # ≈ 1.1" — proportional to widened plan boundary buffer
-=======
-                    # Both endpoints must stay within plan bounds (with tolerance).
-                    _EP_TOL = 50   # ≈ 0.7" — covers label offsets & small overruns
->>>>>>> Stashed changes
                     if (min(p1.x, p2.x) < bx0 - _EP_TOL or
                             max(p1.x, p2.x) > bx1 + _EP_TOL):
                         continue
@@ -260,16 +289,22 @@ def detect_beam_lines(page, profiles: list, plan_bounds: tuple) -> dict:
             adx = abs(ldx)
             ady = abs(ldy)
 
-            # Direction guard — skip perpendicular lines
-            if label_is_h and ady > adx * 1.5:
+            # Direction guard — label orientation must agree with line direction.
+            # Old threshold (1.5×) only rejected clearly-perpendicular lines, so
+            # diagonal "OPEN TO BELOW" indicators (adx ≈ ady) slipped through.
+            # New rule: a label with clear H or V orientation only matches a line
+            # that is also clearly H (adx > ady×2) or clearly V (ady > adx×2).
+            # Labels with square aspect ratios (rotated/angled text) are left
+            # unconstrained so true diagonal beams still match.
+            if label_is_h and not (adx > ady * 2):
                 continue
-            if label_is_v and adx > ady * 1.5:
+            if label_is_v and not (ady > adx * 2):
                 continue
 
             # Parametric projection onto line segment
             t = ((pcx - lx1) * ldx + (pcy - ly1) * ldy) / (ln * ln)
-            # Allow ±10 % extension for labels near span ends
-            if t < -0.10 or t > 1.10:
+            # Allow ±20 % extension for labels near span ends
+            if t < -0.20 or t > 1.20:
                 continue
             t_c = max(0.0, min(1.0, t))
             px_proj = lx1 + t_c * ldx
@@ -312,7 +347,7 @@ def detect_beam_lines(page, profiles: list, plan_bounds: tuple) -> dict:
     matched = len(result)
     print(f"[BEAM_LINES] {matched}/{len(profiles)} profiles matched "
           f"to drawn beam lines")
-    return result
+    return result, all_lines
 
 
 def detect_beam_directions(page, profiles: list, plan_bounds: tuple) -> dict:
@@ -705,7 +740,12 @@ def find_plan_boundary(page, page_w, page_h, text_dict=None):
                 elif _GRID_NUMBER.match(t):
                     try:
                         n = float(t)
-                        if 0.5 <= n <= 25:
+                        # Accept grid numbers 0.5–500.  Upper bound was 25 which
+                        # silently dropped columns numbered 26+ (e.g. a drawing
+                        # spanning grids 21–34 lost its entire right half).
+                        # 500 covers any practical building grid while still
+                        # excluding large dimension/load annotation numbers.
+                        if 0.5 <= n <= 500:
                             all_xs.append(cx)
                             all_ys.append(cy)
                     except ValueError:
@@ -733,9 +773,9 @@ def find_plan_boundary(page, page_w, page_h, text_dict=None):
                       f"from {old_max:.0f} to {max(all_ys):.0f}")
 
     if len(all_xs) >= 2 and len(all_ys) >= 2:
-        # 120 pt buffer ≈ 1.7″ — large enough to include member labels that sit
-        # below/beyond the outermost grid bubble (e.g. HSS10X8X3/8 FLAT at row A).
-        buf = 120
+        # 150 pt buffer ≈ 2.1″ — catches labels at the plan edge and members
+        # that sit just beyond the outermost grid bubble position.
+        buf = 150
         b = (
             max(0,      min(all_xs) - buf),
             max(0,      min(all_ys) - buf),
@@ -800,10 +840,10 @@ def detect_column_symbols(page):
                                   drawing_fill[2]) / 3
 
         items     = d.get("items", [])
-        has_h     = False
-        has_v     = False
         has_curve = False
         n_lines   = 0
+        h_count   = 0   # number of horizontal segments (flanges)
+        v_count   = 0   # number of vertical segments (web)
 
         for item in items:
             kind = item[0]
@@ -819,9 +859,9 @@ def detect_column_symbols(page):
                     if math.hypot(dx, dy) < 2:
                         continue
                     if dx > dy * 1.5:
-                        has_h = True
+                        h_count += 1
                     elif dy > dx * 1.5:
-                        has_v = True
+                        v_count += 1
                 except Exception:
                     continue
             elif kind == "re":
@@ -837,21 +877,30 @@ def detect_column_symbols(page):
                         ra = rw / rh if rh > 0 else 0
                         # Must be reasonably square and large enough to be a mark
                         if rw >= 4 and rh >= 4 and 0.25 < ra < 4.0:
-                            has_h = True
-                            has_v = True
+                            h_count += 2
+                            v_count += 1
                             n_lines += 4
                     except Exception:
                         pass
 
         aspect = w / h if h > 0 else 0
 
-        # ── Accept I/H shape: flanges (horizontal) + web (vertical) ──────────
-        if not has_curve and has_h and has_v:
+        # ── Accept I/H shape: ≥2 flange lines (H) + ≥1 web line (V) ──────────
+        # Requiring TWO horizontal segments (top flange + bottom flange) prevents
+        # L-shapes, corner marks, stiffener ticks, and connection detail boxes
+        # (which typically have only 1 H + 1 V) from being falsely accepted.
+        if not has_curve and h_count >= 2 and v_count >= 1:
             raw.append((cx, cy))
             continue
 
-        # ── Accept small outlined rectangle (some CAD exports use a box) ─────
-        if not has_curve and n_lines == 4 and 0.5 < aspect < 2.0 and w < 28 and h < 28:
+        # ── Accept small FILLED rectangle (some CAD exports use a solid box) ──
+        # Previously accepted ANY 4-line outlined rectangle, which caught
+        # connection plates, stiffener boxes, joist seats and dimension ticks —
+        # all legitimate drawing elements that are NOT column symbols.
+        # Now require near-black fill (brightness < 0.25): only solid black
+        # plan marks qualify.  Un-filled or lightly-shaded boxes are skipped.
+        if (not has_curve and n_lines == 4 and 0.5 < aspect < 2.0
+                and w < 28 and h < 28 and drawing_brightness < 0.25):
             raw.append((cx, cy))
             continue
 
@@ -859,7 +908,7 @@ def detect_column_symbols(page):
         # Many CAD drawings ring the column I/H mark with a small circle.
         # Grid bubbles are large (>45pt); section-cut bubbles rarely have both
         # H and V lines inside them. Limit to bbox 10–45pt to stay specific.
-        if has_curve and has_h and has_v and 10 < w < 45 and 10 < h < 45:
+        if has_curve and h_count >= 2 and v_count >= 1 and 10 < w < 45 and 10 < h < 45:
             raw.append((cx, cy))
 
     # Deduplicate using EXPANDING cluster (DBSCAN-style, eps=15pt).
@@ -1261,6 +1310,13 @@ def classify_member(profile: str,
             return "column" if abs(d1 - d2) < 0.5 else "beam"
         except ValueError:
             return "beam"
+
+    # Abbreviated W-section (depth only — no weight in label, e.g. "W12", "W16")
+    w_abbr = re.match(r'(?<![A-Z0-9])W(\d+)$', p)
+    if w_abbr:
+        # No weight info → treat as beam by default; beam-line override in
+        # build_members will further validate against matched vector lines.
+        return "beam"
 
     w = re.match(r'W(\d+)[Xx](\d+)', p)
     if w:
@@ -1724,6 +1780,41 @@ def build_members(profiles, page_w, page_h,
                 v_grid=v_grid, h_grid=h_grid,
             )
 
+        # ── Beam-line override ────────────────────────────────────────────────
+        # detect_beam_lines() matches labels that sit ON a drawn structural
+        # centreline at (or near) its midpoint.  Column labels are placed AT
+        # the column symbol — never at the mid-span of a long beam centreline.
+        # If a profile (even one claimed by a column symbol in Pass 1) has a
+        # long vector-line match, it IS a beam.  This corrects false-positive
+        # column symbols (annotation boxes, beam flanges, etc.) that grab
+        # nearby beam labels in Pass 1.
+        _MIN_BEAM_PT = 60   # ≈ 6 ft at 1/8" — anything shorter is a tick/stub
+        if mtype == "column" and beam_line_map:
+            _hit = beam_line_map.get(p_idx)
+            if _hit and _hit.get("length_pt", 0) >= _MIN_BEAM_PT:
+                mtype = "beam"
+                if p_idx in symbol_matched_cols:
+                    symbol_matched_cols.discard(p_idx)
+
+        # ── Section-type override ─────────────────────────────────────────────
+        # Light W-sections (W10 weight<22, W12 weight<26) are NEVER used as
+        # columns in structural steel framing.  If a false column symbol claimed
+        # one of these labels in Pass 1 and the beam-line override didn't fire
+        # (e.g. no matching vector line found), trust the section properties and
+        # reclassify back to beam.
+        if mtype == "column" and p_idx in symbol_matched_cols:
+            _wm = re.match(r'W(\d+)[Xx](\d+)', p["profile"].upper())
+            if _wm:
+                _sd, _sw = int(_wm.group(1)), int(_wm.group(2))
+                _clearly_beam = (
+                    (_sd == 10 and _sw < 22) or
+                    (_sd == 12 and _sw < 26) or
+                    (_sd >= 14 and _sw < 30)
+                )
+                if _clearly_beam:
+                    mtype = "beam"
+                    symbol_matched_cols.discard(p_idx)
+
         render_cx, render_cy = p["cx"], p["cy"]
         snapped = False
 
@@ -1765,7 +1856,6 @@ def build_members(profiles, page_w, page_h,
             ly_frac = p["cy"] / page_h
 
             if line_hit:
-<<<<<<< Updated upstream
                 # ── PRIMARY: trust the drawn vector line unconditionally ────
                 #
                 # detect_beam_lines() extracts PDF vector geometry — the line
@@ -1868,80 +1958,6 @@ def build_members(profiles, page_w, page_h,
                               f"(label=({lx_frac:.3f},{ly_frac:.3f}) "
                               f"span=({_bx1:.3f},{_by1:.3f})→({_bx2:.3f},{_by2:.3f})"
                               f" dir={beam_dir})")
-=======
-                # ── PRIMARY: vector line match ───────────────────────────────
-                beam_dir = line_hit["dir"]
-                ex1, ey1 = line_hit["x1"], line_hit["y1"]
-                ex2, ey2 = line_hit["x2"], line_hit["y2"]
-
-                # Snap endpoints to actual column symbol positions so the
-                # overlay line follows the true column-to-column geometry when
-                # the CAD beam line is axis-aligned but the grid is skewed.
-                # 30 pt ≈ 0.4″ — tight enough to avoid grabbing adjacent columns.
-                if column_symbols:
-                    sx1, sy1 = _snap_endpoint_to_column(ex1, ey1, column_symbols, 30)
-                    sx2, sy2 = _snap_endpoint_to_column(ex2, ey2, column_symbols, 30)
-                    snapped_len = math.hypot(sx1 - sx2, sy1 - sy2)
-                    orig_len    = math.hypot(ex1 - ex2, ey1 - ey2)
-                    # Only accept snap if:
-                    #  • both ends moved to distinct positions
-                    #  • snapped length is within 30 % of original (no multi-bay jump)
-                    if snapped_len > 20 and 0.70 * orig_len <= snapped_len <= 1.30 * orig_len:
-                        ex1, ey1 = sx1, sy1
-                        ex2, ey2 = sx2, sy2
-
-                # If line is still axis-aligned (perfectly H or V) after
-                # snapping, the CAD centreline didn't encode the true skewed
-                # geometry.  Try column-pair correction: find the adjacent
-                # columns in the beam direction and use their exact positions
-                # so the overlay follows the real column-to-column angle.
-                still_hv = (abs(ex2 - ex1) < 2 or abs(ey2 - ey1) < 2)
-                if still_hv and column_symbols:
-                    cp = _column_pair_span(
-                        p["cx"], p["cy"], beam_dir,
-                        column_symbols, pts_per_foot)
-                    if cp:
-                        ex1, ey1 = cp["x1"], cp["y1"]
-                        ex2, ey2 = cp["x2"], cp["y2"]
-
-                length_pt = math.hypot(ex2 - ex1, ey2 - ey1)
-                length_ft = round(length_pt / pts_per_foot, 1) if pts_per_foot > 0 else 0.0
-                bx1 = round(ex1 / page_w, 4)
-                by1 = round(ey1 / page_h, 4)
-                bx2 = round(ex2 / page_w, 4)
-                by2 = round(ey2 / page_h, 4)
-                render_cx = (ex1 + ex2) / 2
-                render_cy = (ey1 + ey2) / 2
-
-            else:
-                # ── FALLBACK 1: column-pair span ─────────────────────────────
-                # Use actual column symbol positions → exact column-to-column
-                # line that handles diagonal grids naturally.
-                beam_dir = ((beam_dirs or {}).get(p_idx)
-                            or p.get("dir_hint", "H"))
-                span = _column_pair_span(
-                    p["cx"], p["cy"], beam_dir, column_symbols, pts_per_foot)
-
-                # ── FALLBACK 2: grid-based approximation ─────────────────────
-                if span is None:
-                    _need_v = (beam_dir == "H")
-                    _need_h = (beam_dir == "V")
-                    _can_span = (_need_v and span_v_grid) or (_need_h and span_h_grid)
-                    if _can_span:
-                        span = compute_beam_span(
-                            p["cx"], p["cy"], span_v_grid, span_h_grid,
-                            pts_per_foot, beam_dir,
-                        )
-
-                if span:
-                    length_ft = span["length_ft"]
-                    bx1 = round(span["x1"] / page_w, 4)
-                    by1 = round(span["y1"] / page_h, 4)
-                    bx2 = round(span["x2"] / page_w, 4)
-                    by2 = round(span["y2"] / page_h, 4)
-                    render_cx = (span["x1"] + span["x2"]) / 2
-                    render_cy = (span["y1"] + span["y2"]) / 2
->>>>>>> Stashed changes
 
         sym = profile_sym_pos.get(p_idx)
         members.append({
@@ -2109,7 +2125,6 @@ async def get_page_image(filename: str, page_index: int):
             raise HTTPException(404, "Image files have only one page")
         pil = PILImage.open(file_path).convert("RGB")
 
-<<<<<<< Updated upstream
     MAX_PREVIEW_W = 2800
     if pil.width > MAX_PREVIEW_W:
         r = MAX_PREVIEW_W / pil.width
@@ -2118,46 +2133,6 @@ async def get_page_image(filename: str, page_index: int):
     pil.save(buf, format="PNG")
     b64 = base64.b64encode(buf.getvalue()).decode()
     return {"image": f"data:image/png;base64,{b64}", "page_index": page_index}
-=======
-    # Full-resolution preview for page 0 (shown in main canvas immediately)
-    pil0 = _render_page_pil(file_path, 0, max_width=2800)
-    main_image = _pil_to_b64(pil0, quality=85)
-
-    # Small thumbnails for every page (shown in the sidebar page picker)
-    THUMB_W = 300
-    thumbnails = []
-    for i in range(page_count):
-        pil_t = _render_page_pil(file_path, i, max_width=THUMB_W)
-        thumbnails.append(_pil_to_b64(pil_t, quality=70))
-
-    return {
-        "image":      main_image,
-        "width":      pil0.width,
-        "height":     pil0.height,
-        "page_count": page_count,
-        "filename":   file.filename,
-        "thumbnails": thumbnails,   # list of base64 JPEG per page
-    }
-
-
-class PageImageRequest(BaseModel):
-    filename:   str
-    page_index: int = 0
-
-@app.post("/page-image")
-async def get_page_image(req: PageImageRequest):
-    """Return the full-resolution preview image for a specific page."""
-    file_path = os.path.join(UPLOAD_DIR, req.filename)
-    if not os.path.exists(file_path):
-        from fastapi import HTTPException
-        raise HTTPException(status_code=404, detail="File not found")
-    pil = _render_page_pil(file_path, req.page_index, max_width=2800)
-    return {
-        "image":  _pil_to_b64(pil, quality=85),
-        "width":  pil.width,
-        "height": pil.height,
-    }
->>>>>>> Stashed changes
 
 
 @app.post("/analyse")
@@ -2240,7 +2215,6 @@ async def analyse_pdf(req: AnalysisRequest):
         pts_per_foot = scale_to_pts_per_foot(req.scale_ratio) if req.scale_ratio else 0.0
         print(f"[ANALYSE] scale_ratio={req.scale_ratio}  pts_per_foot={pts_per_foot:.2f}")
 
-<<<<<<< Updated upstream
         # 6. PRIMARY: match beam centerlines to profile labels
         #    • Vector PDF: read page.get_drawings() — exact mathematical geometry.
         #    • Raster image: render to 300-DPI greyscale and run HoughLinesP.
@@ -2258,36 +2232,88 @@ async def analyse_pdf(req: AnalysisRequest):
             print(f"[ANALYSE] Raster Hough beam_line_map: {len(beam_line_map)} hits")
             del _pix, _gray_arr   # free memory
         else:
-            beam_line_map = (
-                {} if is_raster
-                else detect_beam_lines(page, profiles, plan_bounds)
-            )
-=======
-        # 5b. For raster images, pre-compute reliable span grids from column
-        #     positions BEFORE beam-line matching, so both detect_beam_lines_raster
-        #     and build_members can use the same accurate column-based grids.
-        if is_raster:
-            raster_span_vg, raster_span_hg = precompute_span_grids(
-                profiles, plan_bounds, page_w, page_h)
-            # Replace noisy OCR-derived grids with column-position grids
-            v_grid = raster_span_vg
-            h_grid = raster_span_hg
+            if is_raster:
+                beam_line_map   = {}
+                _all_struct_lns = []
+            else:
+                beam_line_map, _all_struct_lns = detect_beam_lines(
+                    page, profiles, plan_bounds, pts_per_foot=pts_per_foot)
 
-        # 6. PRIMARY: match vector beam lines
-        #    Vector PDFs: use PyMuPDF path geometry (exact CAD lines)
-        #    Raster images: use Hough line detection on the pixel image
-        #    Hough gives exact centerline Y/X; column grids give span endpoints.
-        if is_raster and ext in _IMAGE_EXTS:
-            beam_line_map = detect_beam_lines_raster(
-                tmp_path, profiles, plan_bounds,
-                span_v_grid=raster_span_vg,
-                span_h_grid=raster_span_hg,
-            )
-        elif is_raster:
-            beam_line_map = {}
-        else:
-            beam_line_map = detect_beam_lines(page, profiles, plan_bounds)
->>>>>>> Stashed changes
+        # ── Unlabeled beam detection ──────────────────────────────────────────
+        # Only runs when the drawing has ZERO profile labels (e.g. a framing plan
+        # where the engineer drew all beam lines but added no text tags).
+        # When labeled profiles exist we skip this entirely — labeled detection is
+        # already complete and we don't want to double-count.
+        #
+        # Safety filters applied to every candidate line:
+        #   F1  Orthogonal only (H or V) — unlabeled diagonal lines are
+        #       indistinguishable from braces, so we skip them.
+        #   F2  Length in structural range: MIN_LEN–MAX_LEN (already applied in
+        #       detect_beam_lines, so all_struct_lns satisfies this).
+        #   F3  Does NOT span >85 % of the plan width (H) or plan height (V) —
+        #       full-width lines are grid / dimension lines, not beams.
+        #   F4  Deduplicate: skip if another synthetic is already within 40 pt.
+        #   F5  Cap at 200 synthetics to prevent memory issues on dense drawings.
+        if not is_raster and len(profiles) == 0 and _all_struct_lns:
+            _pb = plan_bounds
+            _plan_w = _pb[2] - _pb[0]
+            _plan_h = _pb[3] - _pb[1]
+            _MAX_H_FRAC = 0.85   # F3: H-line must be shorter than 85 % of plan width
+            _MAX_V_FRAC = 0.85   # F3: V-line must be shorter than 85 % of plan height
+            _DEDUP_R    = 40     # F4: midpoint deduplication radius
+            _SYN_CAP    = 200    # F5: hard cap
+
+            _syn_profiles  = []
+            _syn_line_map  = {}
+            _seen_mids: list[tuple] = []
+
+            for (lx1, ly1, lx2, ly2, ln) in _all_struct_lns:
+                if len(_syn_profiles) >= _SYN_CAP:
+                    break
+                adx = abs(lx2 - lx1)
+                ady = abs(ly2 - ly1)
+
+                # F1 — orthogonal only
+                if adx > ady * 2:
+                    bdir = "H"
+                elif ady > adx * 2:
+                    bdir = "V"
+                else:
+                    continue   # diagonal — skip
+
+                # F3 — reject full-plan-width / full-plan-height lines
+                if bdir == "H" and adx > _plan_w * _MAX_H_FRAC:
+                    continue
+                if bdir == "V" and ady > _plan_h * _MAX_V_FRAC:
+                    continue
+
+                mx = (lx1 + lx2) / 2
+                my = (ly1 + ly2) / 2
+
+                # F4 — deduplicate
+                if any(math.hypot(smx - mx, smy - my) < _DEDUP_R
+                       for smx, smy in _seen_mids):
+                    continue
+
+                syn_idx = len(_syn_profiles)
+                _syn_profiles.append({
+                    "profile":  "?",
+                    "cx": mx, "cy": my,
+                    "dir_hint": bdir,
+                    "bbox_w": 20.0, "bbox_h": 8.0,
+                })
+                _syn_line_map[syn_idx] = {
+                    "x1": lx1, "y1": ly1,
+                    "x2": lx2, "y2": ly2,
+                    "dir": bdir, "length_pt": ln,
+                }
+                _seen_mids.append((mx, my))
+
+            if _syn_profiles:
+                print(f"[ANALYSE] {len(_syn_profiles)} unlabeled beam lines detected "
+                      f"(zero labeled profiles on this page)")
+                profiles    = _syn_profiles
+                beam_line_map = _syn_line_map
 
         # 7. FALLBACK direction detection
         #    • Vector: use adjacent drawn lines via detect_beam_directions().
