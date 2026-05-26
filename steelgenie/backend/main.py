@@ -160,8 +160,233 @@ def compute_beam_span(cx: float, cy: float,
     return None
 
 
+def _snap_to_grid_lines(x1: float, y1: float,
+                        x2: float, y2: float,
+                        bdir: str,
+                        v_grid: list, h_grid: list,
+                        snap_dist: float = 35.0) -> tuple:
+    """
+    Snap H/V beam endpoints to the nearest column grid line.
+
+    Column grid lines (v_grid = vertical X positions, h_grid = horizontal Y
+    positions) represent column CENTRELINES.  The beam line in the PDF often
+    stops short of the centreline by half the column depth.  Snapping to the
+    nearest grid line gives the true centre-to-centre structural span.
+
+    snap_dist = 35 pt ≈ 3.9 ft at 1/8" scale — wide enough to bridge the
+    half-column-depth gap PLUS any beam-face drawing offset (max ~3.5 ft
+    combined), tight enough not to jump across to the wrong adjacent grid line
+    (typical bay width >15 ft means the next column is always >150 pt away).
+
+    Only EXTENDS the beam — never shortens it.
+    """
+    if bdir == "H" and v_grid:
+        lx = min(x1, x2)   # left  endpoint X
+        rx = max(x1, x2)   # right endpoint X
+
+        # Left snap: find the nearest v_grid line to the LEFT of lx
+        left_cands = [vx for vx in v_grid if lx - snap_dist <= vx < lx]
+        if left_cands:
+            new_lx = max(left_cands)   # closest grid left of lx
+            if x1 <= x2:
+                x1 = new_lx
+            else:
+                x2 = new_lx
+
+        # Right snap: find the nearest v_grid line to the RIGHT of rx
+        rx = max(x1, x2)   # recompute after possible left snap
+        right_cands = [vx for vx in v_grid if rx < vx <= rx + snap_dist]
+        if right_cands:
+            new_rx = min(right_cands)
+            if x1 <= x2:
+                x2 = new_rx
+            else:
+                x1 = new_rx
+
+    elif bdir == "V" and h_grid:
+        ty = min(y1, y2)   # top    endpoint Y
+        by_ = max(y1, y2)  # bottom endpoint Y
+
+        # Top snap
+        top_cands = [hy for hy in h_grid if ty - snap_dist <= hy < ty]
+        if top_cands:
+            new_ty = max(top_cands)
+            if y1 <= y2:
+                y1 = new_ty
+            else:
+                y2 = new_ty
+
+        # Bottom snap
+        by_ = max(y1, y2)
+        bot_cands = [hy for hy in h_grid if by_ < hy <= by_ + snap_dist]
+        if bot_cands:
+            new_by = min(bot_cands)
+            if y1 <= y2:
+                y2 = new_by
+            else:
+                y1 = new_by
+
+    return x1, y1, x2, y2, math.hypot(x2 - x1, y2 - y1)
+
+
+def _snap_to_columns_along_axis(x1: float, y1: float,
+                                x2: float, y2: float,
+                                col_syms: list,
+                                perp_tol: float = 30.0,
+                                snap_dist: float = 30.0) -> tuple:
+    """
+    Snap both endpoints of a matched beam segment to the nearest column
+    symbol that lies along the beam axis.
+
+    In structural drawings the beam centreline is drawn from column FACE to
+    column FACE (or even slightly short of the face).  The column I-symbol
+    is placed at the column CENTRE.  This function bridges that gap so the
+    extracted length equals the true centre-to-centre span.
+
+    Parameters
+    ----------
+    perp_tol  : max perpendicular offset (pts) from beam axis to column centre
+    snap_dist : max distance (pts) the endpoint can be FROM the column centre
+                before we refuse to snap.  30 pt ≈ 2.7″ at ⅛″ scale — enough
+                to cover half the depth of the deepest common column section
+                while avoiding accidental jumps to an adjacent column symbol.
+    """
+    if not col_syms:
+        return x1, y1, x2, y2, math.hypot(x2 - x1, y2 - y1)
+
+    dx = x2 - x1
+    dy = y2 - y1
+    ln = math.hypot(dx, dy)
+    if ln < 1.0:
+        return x1, y1, x2, y2, ln
+
+    ux, uy = dx / ln, dy / ln   # unit along beam
+    px, py = -uy, ux            # unit perpendicular
+
+    best_left_t  = 0.0    # parametric position of best left-snap column  (0 = no snap)
+    best_right_t = ln     # parametric position of best right-snap column  (ln = no snap)
+
+    for sym in col_syms:
+        cx, cy = sym["cx"], sym["cy"]
+        rv = (cx - x1, cy - y1)
+        t    = rv[0] * ux + rv[1] * uy
+        perp = abs(rv[0] * px + rv[1] * py)
+
+        if perp > perp_tol:
+            continue   # column is not on this beam's axis
+
+        # Left end: column is just before x1 (negative t, within snap_dist)
+        if -snap_dist <= t < best_left_t:
+            best_left_t = t
+
+        # Right end: column is just past x2 (t > ln, within snap_dist)
+        if best_right_t < t <= ln + snap_dist:
+            best_right_t = t
+
+    ox1, oy1 = x1, y1   # keep original origin for right-end computation
+    if best_left_t < 0:
+        x1 = ox1 + best_left_t * ux
+        y1 = oy1 + best_left_t * uy
+    if best_right_t > ln:
+        x2 = ox1 + best_right_t * ux
+        y2 = oy1 + best_right_t * uy
+
+    return x1, y1, x2, y2, math.hypot(x2 - x1, y2 - y1)
+
+
+def _extend_with_thin_segs(x1: float, y1: float, x2: float, y2: float,
+                           thin_segs: list,
+                           angle_tol_deg: float = 4.0,
+                           gap_tol: float = 30.0,
+                           colinear_tol: float = 5.0) -> tuple:
+    """
+    Extend a matched beam segment at both ends using thin continuation segments.
+
+    In many CAD drawings the beam centreline transitions to a hairline stroke near
+    the column connection zone.  The main matching step ignores those thin strokes
+    but we save them in thin_segs.  After the best thick segment is found we stretch
+    it to cover any collinear thin continuations, giving the accurate
+    column-face-to-column-face beam length.
+
+    Safety constraints (prevent over-extension):
+      • angle must agree within angle_tol_deg (default 4°)
+      • perpendicular offset must be < colinear_tol pts (default 5 pt ≈ 0.07″)
+      • gap between segments must be < gap_tol pts (default 18 pt ≈ 0.25″)
+      • at most 4 passes (handles chained thin segments, e.g. 2 short pieces at one end)
+
+    Returns (x1, y1, x2, y2, length).
+    """
+    if not thin_segs:
+        return x1, y1, x2, y2, math.hypot(x2 - x1, y2 - y1)
+
+    for _pass in range(4):
+        dx = x2 - x1
+        dy = y2 - y1
+        ln = math.hypot(dx, dy)
+        if ln < 1.0:
+            break
+        ux, uy = dx / ln, dy / ln
+        px, py = -uy, ux
+        ang = math.atan2(dy, dx)
+        if ang < 0:
+            ang += math.pi
+
+        ext_left  = 0.0   # most-negative t on the left side (0 = no extension)
+        ext_right = ln    # largest t on the right side (ln = no extension)
+
+        for (sx1, sy1, sx2, sy2, _) in thin_segs:
+            sdx, sdy = sx2 - sx1, sy2 - sy1
+            sang = math.atan2(sdy, sdx)
+            if sang < 0:
+                sang += math.pi
+            da = abs(ang - sang)
+            if da > math.pi / 2:
+                da = math.pi - da
+            if math.degrees(da) > angle_tol_deg:
+                continue
+
+            # Perpendicular distance — both endpoints checked, take the minimum
+            rv1x, rv1y = sx1 - x1, sy1 - y1
+            rv2x, rv2y = sx2 - x1, sy2 - y1
+            pd = min(abs(rv1x * px + rv1y * py), abs(rv2x * px + rv2y * py))
+            if pd > colinear_tol:
+                continue
+
+            # Parametric projections onto our axis
+            t1 = rv1x * ux + rv1y * uy
+            t2 = rv2x * ux + rv2y * uy
+            if t1 > t2:
+                t1, t2 = t2, t1
+
+            # Left end: thin seg reaches before our current x1 but is close to it
+            if t1 < 0 and t2 >= -gap_tol:
+                ext_left = min(ext_left, t1)
+
+            # Right end: thin seg reaches past our current x2 but is close to it
+            if t2 > ln and t1 <= ln + gap_tol:
+                ext_right = max(ext_right, t2)
+
+        changed = False
+        ox1, oy1 = x1, y1   # keep original origin for right-end computation
+        if ext_left < 0:
+            x1 = ox1 + ext_left * ux
+            y1 = oy1 + ext_left * uy
+            changed = True
+        if ext_right > ln:
+            x2 = ox1 + ext_right * ux   # always relative to original origin
+            y2 = oy1 + ext_right * uy
+            changed = True
+        if not changed:
+            break
+
+    return x1, y1, x2, y2, math.hypot(x2 - x1, y2 - y1)
+
+
 def detect_beam_lines(page, profiles: list, plan_bounds: tuple,
-                      pts_per_foot: float = 0.0) -> dict:
+                      pts_per_foot: float = 0.0,
+                      column_symbols: list = None,
+                      v_grid: list = None,
+                      h_grid: list = None) -> dict:
     """
     PRIMARY beam detection: find structural centerlines in the PDF vector drawing
     and match them to steel-section text labels.
@@ -203,6 +428,7 @@ def detect_beam_lines(page, profiles: list, plan_bounds: tuple,
     LABEL_R  = 100   # wider: labels in dense drawings can be pushed 70-100 pt from centreline
 
     all_lines: list[tuple] = []   # (x1, y1, x2, y2, length)
+    thin_segs: list[tuple] = []   # thin-stroke segments at beam/column junctions
 
     try:
         for d in page.get_drawings():
@@ -225,10 +451,44 @@ def detect_beam_lines(page, profiles: list, plan_bounds: tuple,
             # Type C — Thin construction / hidden lines that carry no dash
             #   property but are drawn hairline-thin in CAD (lineweight ≤ 0.3 pt).
             #   Structural beam centrelines always have a measurable weight.
-            #   Skip any path with an explicitly set width < 0.3 pt.
+            #   Skip any path with an explicitly set width < 0.3 pt for the main
+            #   matching pool — but save valid segments into thin_segs so we can
+            #   extend a matched thick segment to its true column-face length.
             #   (Width = 0 or None means "default" in some exporters — keep those.)
             _lw = d.get("width") or 0
             if 0 < _lw < 0.3:
+                for _item in d.get("items", []):
+                    if _item[0] != "l":
+                        continue
+                    try:
+                        _p1, _p2 = _item[1], _item[2]
+                        _tln = math.hypot(abs(_p2.x - _p1.x), abs(_p2.y - _p1.y))
+                        # Use a much smaller minimum than all_lines (MIN_LEN=45).
+                        # Column-zone beam stubs can be very short (a few pts) but
+                        # are still valid continuations.  The collinearity check in
+                        # _extend_with_thin_segs keeps spurious tiny marks out.
+                        if _tln < 3.0 or _tln > MAX_LEN:
+                            continue
+                        _tmx = (_p1.x + _p2.x) / 2
+                        _tmy = (_p1.y + _p2.y) / 2
+                        # 60 pt midpoint tolerance matches all_lines — catches
+                        # thin column-zone stubs for edge/cantilever beams.
+                        _TMID = 60
+                        if not (bx0 - _TMID <= _tmx <= bx1 + _TMID and
+                                by0 - _TMID <= _tmy <= by1 + _TMID):
+                            continue
+                        # Both endpoints must stay within plan bounds (+ tolerance).
+                        # Raised to 100 pt to match all_lines _EP_TOL.
+                        _TEP = 100
+                        if (min(_p1.x, _p2.x) < bx0 - _TEP or
+                                max(_p1.x, _p2.x) > bx1 + _TEP):
+                            continue
+                        if (min(_p1.y, _p2.y) < by0 - _TEP or
+                                max(_p1.y, _p2.y) > by1 + _TEP):
+                            continue
+                        thin_segs.append((_p1.x, _p1.y, _p2.x, _p2.y, _tln))
+                    except Exception:
+                        continue
                 continue
 
             for item in d.get("items", []):
@@ -243,14 +503,19 @@ def detect_beam_lines(page, profiles: list, plan_bounds: tuple,
                         continue
                     mx = (p1.x + p2.x) / 2
                     my = (p1.y + p2.y) / 2
-                    # Midpoint must be inside plan boundary
-                    if not (bx0 <= mx <= bx1 and by0 <= my <= by1):
+                    # Midpoint must be inside (or very close to) the plan boundary.
+                    # A 60 pt tolerance captures cantilever beams that project beyond
+                    # the last column: their centreline midpoint can sit up to ~6 ft
+                    # (≈54 pt at 1/8" scale) outside the detected plan box.
+                    _MID_TOL = 60
+                    if not (bx0 - _MID_TOL <= mx <= bx1 + _MID_TOL and
+                            by0 - _MID_TOL <= my <= by1 + _MID_TOL):
                         continue
-                    # FIX: BOTH endpoints must also stay within plan bounds
-                    # (with a small tolerance).  This prevents long annotation/
-                    # dimension lines whose midpoint barely falls inside the plan
-                    # from extending far into the notes or title block area.
-                    _EP_TOL = 80   # ≈ 1.1" — proportional to widened plan boundary buffer
+                    # BOTH endpoints must also stay within plan bounds + tolerance.
+                    # This prevents long annotation / dimension lines whose midpoint
+                    # barely falls inside the plan from extending far into the notes
+                    # or title-block area.
+                    _EP_TOL = 100   # ≈ 1.4" — covers full cantilever segments
                     if (min(p1.x, p2.x) < bx0 - _EP_TOL or
                             max(p1.x, p2.x) > bx1 + _EP_TOL):
                         continue
@@ -303,8 +568,9 @@ def detect_beam_lines(page, profiles: list, plan_bounds: tuple,
 
             # Parametric projection onto line segment
             t = ((pcx - lx1) * ldx + (pcy - ly1) * ldy) / (ln * ln)
-            # Allow ±20 % extension for labels near span ends
-            if t < -0.20 or t > 1.20:
+            # Allow ±30 % extension for labels near span ends or on short
+            # cantilever stubs where the label sits close to the tip.
+            if t < -0.30 or t > 1.30:
                 continue
             t_c = max(0.0, min(1.0, t))
             px_proj = lx1 + t_c * ldx
@@ -317,18 +583,45 @@ def detect_beam_lines(page, profiles: list, plan_bounds: tuple,
             # The beam label is placed ON the beam centreline near mid-span.
             # A column-grid segment that merely passes close to the label
             # will have the label at an off-centre t (not t≈0.5).
-            # Score = (proximity) × (midpoint closeness)
-            # This beats length weighting which falsely rewarded long grid
-            # segments over shorter but more central beam lines.
+            # Score = proximity × (0.6 + 0.4 × t_center)
+            # proximity dominates (minimum weight 0.6) so a very close segment
+            # with the label near an end still beats a farther "more central"
+            # impostor.  t_center (max +0.4) acts as a tiebreaker only when two
+            # segments are at a similar distance from the label.
             proximity  = 1.0 - dist / LABEL_R           # 0→1, higher = closer
             t_center   = 1.0 - 2.0 * abs(t_c - 0.5)    # 0→1, 1=midpoint
-            score = proximity * t_center
+            score = proximity * (0.6 + 0.4 * t_center)
             if score > best_score:
                 best_score = score
                 best       = (lx1, ly1, lx2, ly2, ln)
 
         if best:
             lx1, ly1, lx2, ly2, ln = best
+            # ── Pass 1: hairline stubs at column connection zones ─────────────
+            # The beam centreline transitions to a thin stroke (<0.3 pt) inside
+            # the column zone.  Extend using those saved thin_segs.
+            if thin_segs:
+                lx1, ly1, lx2, ly2, ln = _extend_with_thin_segs(
+                    lx1, ly1, lx2, ly2, thin_segs)
+            # ── Pass 3a: column-symbol snap ───────────────────────────────────
+            # When I/H column symbols are detected, snap endpoints to the
+            # nearest symbol that lies along the beam axis.
+            if column_symbols:
+                lx1, ly1, lx2, ly2, ln = _snap_to_columns_along_axis(
+                    lx1, ly1, lx2, ly2, column_symbols)
+            # ── Pass 3b: column grid-line snap (always runs) ──────────────────
+            # Column grid lines (v_grid / h_grid) mark column CENTRELINES and
+            # are detected reliably even when no I-symbols are drawn.  Snapping
+            # H-beam endpoints to the nearest v_grid line (and V-beam endpoints
+            # to the nearest h_grid line) gives the true centre-to-centre span
+            # without requiring symbol detection.
+            if v_grid or h_grid:
+                # determine direction from current best segment
+                _adx = abs(lx2 - lx1)
+                _ady = abs(ly2 - ly1)
+                _bdir_tmp = "H" if _adx > _ady * 2 else ("V" if _ady > _adx * 2 else "D")
+                lx1, ly1, lx2, ly2, ln = _snap_to_grid_lines(
+                    lx1, ly1, lx2, ly2, _bdir_tmp, v_grid or [], h_grid or [])
             adx = abs(lx2 - lx1)
             ady = abs(ly2 - ly1)
             if adx > ady * 2:
@@ -1458,7 +1751,14 @@ def extract_profiles(page, page_w, page_h, plan_bounds, text_dict=None):
     def _try_add(text, cx, cy, rot_pass=0, bbox_w=20.0, bbox_h=8.0):
         if not text:
             return
-        if not (bx0 <= cx <= bx1 and by0 <= cy <= by1):
+        # Allow labels up to 60 pt outside the plan boundary.
+        # Edge beams (top/bottom chord, right-most column strip) and cantilever
+        # labels often sit right on the boundary line or just beyond it.
+        # 60 pt ≈ 6.7 ft at 1/8" scale — enough to catch any edge label while
+        # still excluding notes / title-block text which sits 200+ pt away.
+        _LABEL_EDGE = 60
+        if not (bx0 - _LABEL_EDGE <= cx <= bx1 + _LABEL_EDGE and
+                by0 - _LABEL_EDGE <= cy <= by1 + _LABEL_EDGE):
             return
         if any(zx0 <= cx <= zx1 and zy0 <= cy <= zy1
                for zx0, zy0, zx1, zy1 in excluded_zones):
@@ -1855,41 +2155,69 @@ def build_members(profiles, page_w, page_h,
             lx_frac = p["cx"] / page_w
             ly_frac = p["cy"] / page_h
 
+            # Determine whether the vector line match is trustworthy.
+            # Two rejection criteria:
+            #   (A) segment too short  → dimension tick / hatch stub
+            #   (B) label is far from the segment AND _span_valid fails →
+            #       annotation / leader line was picked over the real beam
+            #       (happens in complex plans with many non-beam lines).
+            # A rejected match falls through to the grid-based fallback.
+            _use_line_hit = False
             if line_hit:
-                # ── PRIMARY: trust the drawn vector line unconditionally ────
-                #
-                # detect_beam_lines() extracts PDF vector geometry — the line
-                # segment IS the beam centreline as drawn by the structural
-                # engineer.  Beam labels in complex drawings are often placed
-                # off to the side with a leader line, so the label's (cx, cy)
-                # can legitimately be 60–100 pt from the centreline.  Validating
-                # against label position causes valid matches to be discarded,
-                # leaving the chip at the label position while neighbouring
-                # beams' lines are drawn at the centreline — the visual
-                # "chip here, line over there" offset the user reported.
-                #
-                # We only reject a match when the line is too short to be a
-                # real structural bay (< MIN_STRUCT_PT).  Short lines are
-                # dimension ticks, hatch lines, or leader stubs that occasionally
-                # fall within LABEL_R of a label.
                 MIN_STRUCT_PT = 60   # ≈ 6 ft at 1/8" scale
                 beam_dir  = line_hit["dir"]
                 length_pt = line_hit["length_pt"]
 
-                if length_pt >= MIN_STRUCT_PT:
-                    length_ft = round(length_pt / pts_per_foot, 1) if pts_per_foot > 0 else 0.0
-                    bx1 = round(line_hit["x1"] / page_w, 4)
-                    by1 = round(line_hit["y1"] / page_h, 4)
-                    bx2 = round(line_hit["x2"] / page_w, 4)
-                    by2 = round(line_hit["y2"] / page_h, 4)
-                    # Chip renders at the TRUE midpoint of the span — this
-                    # guarantees the chip and the SVG line always coincide.
-                    render_cx = (line_hit["x1"] + line_hit["x2"]) / 2
-                    render_cy = (line_hit["y1"] + line_hit["y2"]) / 2
-                else:
+                if length_pt < MIN_STRUCT_PT:
                     print(f"[BUILD] Vector match too short ({length_pt:.0f} pt) "
                           f"for {p['profile']} — dropped as annotation line")
-            else:
+                else:
+                    # ── Perpendicular-distance validation ─────────────────────
+                    # Compute how far the label sits from the matched segment.
+                    # Labels placed on the beam centreline are ≤ 20 pt away.
+                    # Leader-line labels can be up to ~80 pt away.
+                    # If the distance exceeds 80 pt, apply _span_valid as a
+                    # geometric sanity check; only reject if that also fails.
+                    _vx1, _vy1 = line_hit["x1"], line_hit["y1"]
+                    _vx2, _vy2 = line_hit["x2"], line_hit["y2"]
+                    _vdx = _vx2 - _vx1
+                    _vdy = _vy2 - _vy1
+                    _vln = math.hypot(_vdx, _vdy)
+                    _perp_ok = True
+                    if _vln > 0:
+                        _tp = (((p["cx"] - _vx1) * _vdx + (p["cy"] - _vy1) * _vdy)
+                               / (_vln * _vln))
+                        _tc = max(0.0, min(1.0, _tp))
+                        _perp_dist = math.hypot(
+                            p["cx"] - (_vx1 + _tc * _vdx),
+                            p["cy"] - (_vy1 + _tc * _vdy))
+                        if _perp_dist > 80.0:
+                            # Suspicious — run span sanity check
+                            _sv_ok = _span_valid(
+                                _vx1 / page_w, _vy1 / page_h,
+                                _vx2 / page_w, _vy2 / page_h,
+                                p["cx"] / page_w, p["cy"] / page_h,
+                                beam_dir)
+                            if not _sv_ok:
+                                _perp_ok = False
+                                print(f"[BUILD] Rejected false vector match for "
+                                      f"{p['profile']} (perp={_perp_dist:.0f} pt, "
+                                      f"span_valid=False) — using grid fallback")
+
+                    if _perp_ok:
+                        _use_line_hit = True
+                        length_ft = (round(length_pt / pts_per_foot, 1)
+                                     if pts_per_foot > 0 else 0.0)
+                        bx1 = round(line_hit["x1"] / page_w, 4)
+                        by1 = round(line_hit["y1"] / page_h, 4)
+                        bx2 = round(line_hit["x2"] / page_w, 4)
+                        by2 = round(line_hit["y2"] / page_h, 4)
+                        # Chip renders at the TRUE midpoint of the span so the
+                        # chip and the SVG line always coincide visually.
+                        render_cx = (line_hit["x1"] + line_hit["x2"]) / 2
+                        render_cy = (line_hit["y1"] + line_hit["y2"]) / 2
+
+            if not _use_line_hit:
                 # ── FALLBACK: grid-based approximation ──────────────────────
                 # Used when no vector centreline was found (raster images, or
                 # diagonal framing plans where H/V detection misses the beam).
@@ -2237,7 +2565,11 @@ async def analyse_pdf(req: AnalysisRequest):
                 _all_struct_lns = []
             else:
                 beam_line_map, _all_struct_lns = detect_beam_lines(
-                    page, profiles, plan_bounds, pts_per_foot=pts_per_foot)
+                    page, profiles, plan_bounds,
+                    pts_per_foot=pts_per_foot,
+                    column_symbols=column_symbols,
+                    v_grid=v_grid,
+                    h_grid=h_grid)
 
         # ── Unlabeled beam detection ──────────────────────────────────────────
         # Only runs when the drawing has ZERO profile labels (e.g. a framing plan
