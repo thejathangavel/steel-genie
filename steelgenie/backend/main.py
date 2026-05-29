@@ -69,11 +69,11 @@ STEEL_PATTERNS = [
     # The (?!\d) lookahead prevents matching partial OCR reads like "W16X3" from
     # "W16X31" or "W16X3128" (garbage from adjacent load annotations).
     r'W\d{1,2}[Xx]\d{2,3}(?!\d)',
-    # Abbreviated W-sections (depth only, no weight) — drawings that label beams
-    # as "W12", "W16" etc. without lbs/ft.  The negative lookaheads/lookbehinds
-    # prevent matching mid-word (e.g. "HSS10X8X3/8" or "W12X26").
+    # WT (Tee) sections: WT6X22, WT8X40, WT12X58 etc.
+    r'WT\d{1,2}[Xx]\d{1,3}(?!\d)',
+    # Abbreviated W-sections (depth only, no weight)
     r'(?<![A-Z0-9])W\d{1,2}(?![Xx\d])',
-    r'HSS[\d.]+[Xx][\d.]+(?:[Xx][\d.]+(?:/[\d.]+)?)?',  # HSS6X6, HSS6X6X1/4, HSS7.00X0.50
+    r'HSS[\d.]+[Xx][\d.]+(?:[Xx][\d.]+(?:/[\d.]+)?)?',
     r'L\d+[Xx]\d+',
     r'C\d+[Xx]\d+',
     r'MC\d+[Xx]\d+',
@@ -81,8 +81,14 @@ STEEL_PATTERNS = [
     r'PIPE[\d.]+',
 ]
 
-_GRID_LETTER = re.compile(r'^[A-Z](\.\d+)?$')
-_GRID_NUMBER  = re.compile(r'^\d+(\.\d+)?$')
+_GRID_LETTER = re.compile(
+    r'^'
+    r'[xX]?'           # optional lowercase/uppercase x prefix (e.g. xB, xC, XD)
+    r'[A-Z]'           # the actual grid letter
+    r'(?:\.\d{1,2})?'  # optional dot-number suffix (e.g. A.2, K.5, B.2)
+    r'$'
+)
+_GRID_NUMBER  = re.compile(r'^\d+(?:\.\d{1,2})?$')  # 1, 2, 2.5, 4.9, 10 etc.
 
 # Max distance (PDF points) between a profile label and a column symbol.
 # Used for the one-to-one greedy symbol→profile matching in build_members.
@@ -141,20 +147,30 @@ def compute_beam_span(cx: float, cy: float,
         bottoms = [gy for gy in h_grid if gy >  cy]
         if tops and bottoms:
             span_pt = min(bottoms) - max(tops)
+            x_pos = cx
+            if v_grid:
+                nearest_vx = min(v_grid, key=lambda gx: abs(gx - cx))
+                if abs(nearest_vx - cx) < 60:
+                    x_pos = nearest_vx
             return {
                 "length_ft": round(span_pt / pts_per_foot, 1) if pts_per_foot > 0 else 0.0,
-                "x1": cx,         "y1": max(tops),
-                "x2": cx,         "y2": min(bottoms),
+                "x1": x_pos,      "y1": max(tops),
+                "x2": x_pos,      "y2": min(bottoms),
             }
     else:  # "H" — default
         lefts  = [gx for gx in v_grid if gx <= cx]
         rights = [gx for gx in v_grid if gx >  cx]
         if lefts and rights:
             span_pt = min(rights) - max(lefts)
+            y_pos = cy
+            if h_grid:
+                nearest_hy = min(h_grid, key=lambda gy: abs(gy - cy))
+                if abs(nearest_hy - cy) < 60:
+                    y_pos = nearest_hy
             return {
                 "length_ft": round(span_pt / pts_per_foot, 1) if pts_per_foot > 0 else 0.0,
-                "x1": max(lefts), "y1": cy,
-                "x2": min(rights), "y2": cy,
+                "x1": max(lefts), "y1": y_pos,
+                "x2": min(rights), "y2": y_pos,
             }
 
     return None
@@ -368,11 +384,14 @@ def _extend_with_thin_segs(x1: float, y1: float, x2: float, y2: float,
 
         changed = False
         ox1, oy1 = x1, y1   # keep original origin for right-end computation
-        if ext_left < 0:
+        # Cap per-side extension at 40 pt — enough to cover half a column depth
+        # but not enough to chain through multiple bays along a column grid line.
+        _MAX_EXT = 40.0
+        if ext_left < 0 and abs(ext_left) <= _MAX_EXT:
             x1 = ox1 + ext_left * ux
             y1 = oy1 + ext_left * uy
             changed = True
-        if ext_right > ln:
+        if ext_right > ln and (ext_right - ln) <= _MAX_EXT:
             x2 = ox1 + ext_right * ux   # always relative to original origin
             y2 = oy1 + ext_right * uy
             changed = True
@@ -426,6 +445,19 @@ def detect_beam_lines(page, profiles: list, plan_bounds: tuple,
     # Fall back to 700 pt (≈78 ft at 1/8") when scale is unknown.
     MAX_LEN  = int(pts_per_foot * 80) if pts_per_foot > 0 else 700
     LABEL_R  = 100   # wider: labels in dense drawings can be pushed 70-100 pt from centreline
+
+    # Per-direction length caps: reject any matched line longer than 1.5× the
+    # widest detected structural bay.  Catches plan boundary lines and full-height
+    # column grid lines that pass close to beam labels on the plan edges.
+    def _max_bay(grid: list) -> float:
+        sg = sorted(grid or [])
+        if len(sg) < 2:
+            return float("inf")
+        return max(b - a for a, b in zip(sg, sg[1:]))
+    _mb_w = _max_bay(v_grid)
+    _mb_h = _max_bay(h_grid)
+    MAX_H_MATCH = _mb_w * 1.5 if _mb_w < float("inf") else MAX_LEN
+    MAX_V_MATCH = _mb_h * 1.5 if _mb_h < float("inf") else MAX_LEN
 
     all_lines: list[tuple] = []   # (x1, y1, x2, y2, length)
     thin_segs: list[tuple] = []   # thin-stroke segments at beam/column junctions
@@ -555,15 +587,19 @@ def detect_beam_lines(page, profiles: list, plan_bounds: tuple,
             ady = abs(ldy)
 
             # Direction guard — label orientation must agree with line direction.
-            # Old threshold (1.5×) only rejected clearly-perpendicular lines, so
-            # diagonal "OPEN TO BELOW" indicators (adx ≈ ady) slipped through.
-            # New rule: a label with clear H or V orientation only matches a line
-            # that is also clearly H (adx > ady×2) or clearly V (ady > adx×2).
-            # Labels with square aspect ratios (rotated/angled text) are left
-            # unconstrained so true diagonal beams still match.
-            if label_is_h and not (adx > ady * 2):
+            # A horizontal label shouldn't match a purely vertical line, and vice versa.
+            # Diagonal lines are allowed to be matched by both horizontal and vertical labels
+            # because CAD drawings frequently place horizontal text next to diagonal beams.
+            if label_is_h and (ady > adx * 2):
                 continue
-            if label_is_v and not (ady > adx * 2):
+            if label_is_v and (adx > ady * 2):
+                continue
+
+            # Per-direction max length guard — reject column grid/boundary lines
+            # that are longer than 1.5× the widest structural bay.
+            if ady > adx * 2 and ln > MAX_V_MATCH:   # long vertical line
+                continue
+            if adx > ady * 2 and ln > MAX_H_MATCH:   # long horizontal line
                 continue
 
             # Parametric projection onto line segment
@@ -577,6 +613,15 @@ def detect_beam_lines(page, profiles: list, plan_bounds: tuple,
             py_proj = ly1 + t_c * ldy
             dist = math.hypot(pcx - px_proj, pcy - py_proj)
             if dist >= LABEL_R:
+                continue
+
+            # ── Reject Text Underlines ────────────────────────────────────────
+            # If the matched line length perfectly matches the width/height of the
+            # label bounding box, and it is very close to the label, it is almost
+            # certainly an underline or a bounding-box line, not a structural beam.
+            if label_is_h and dist < 12 and abs(ln - lbw) < 15:
+                continue
+            if label_is_v and dist < 12 and abs(ln - lbh) < 15:
                 continue
 
             # ── Composite score ───────────────────────────────────────────
@@ -609,19 +654,19 @@ def detect_beam_lines(page, profiles: list, plan_bounds: tuple,
             if column_symbols:
                 lx1, ly1, lx2, ly2, ln = _snap_to_columns_along_axis(
                     lx1, ly1, lx2, ly2, column_symbols)
-            # ── Pass 3b: column grid-line snap (always runs) ──────────────────
-            # Column grid lines (v_grid / h_grid) mark column CENTRELINES and
-            # are detected reliably even when no I-symbols are drawn.  Snapping
-            # H-beam endpoints to the nearest v_grid line (and V-beam endpoints
-            # to the nearest h_grid line) gives the true centre-to-centre span
-            # without requiring symbol detection.
+            # ── Pass 3b: tight grid-line snap ────────────────────────────────────
+            # The CAD beam centreline is drawn to the column FACE, not the
+            # column CENTRELINE. snap_dist=18pt bridges that small gap only.
+            # 18 pt ≈ 2 ft at 1/8" — enough to reach the grid centreline from
+            # the drawn line end, but too small to jump past an intermediate
+            # horizontal beam (which would be 20+ pt away).
             if v_grid or h_grid:
-                # determine direction from current best segment
                 _adx = abs(lx2 - lx1)
                 _ady = abs(ly2 - ly1)
                 _bdir_tmp = "H" if _adx > _ady * 2 else ("V" if _ady > _adx * 2 else "D")
                 lx1, ly1, lx2, ly2, ln = _snap_to_grid_lines(
-                    lx1, ly1, lx2, ly2, _bdir_tmp, v_grid or [], h_grid or [])
+                    lx1, ly1, lx2, ly2, _bdir_tmp, v_grid or [], h_grid or [],
+                    snap_dist=18.0)
             adx = abs(lx2 - lx1)
             ady = abs(ly2 - ly1)
             if adx > ady * 2:
@@ -1135,8 +1180,7 @@ def detect_column_symbols(page):
         items     = d.get("items", [])
         has_curve = False
         n_lines   = 0
-        h_count   = 0   # number of horizontal segments (flanges)
-        v_count   = 0   # number of vertical segments (web)
+        line_angles = []
 
         for item in items:
             kind = item[0]
@@ -1147,14 +1191,12 @@ def detect_column_symbols(page):
                 n_lines += 1
                 try:
                     p1, p2 = item[1], item[2]
-                    dx = abs(p2.x - p1.x)
-                    dy = abs(p2.y - p1.y)
+                    dx = p2.x - p1.x
+                    dy = p2.y - p1.y
                     if math.hypot(dx, dy) < 2:
                         continue
-                    if dx > dy * 1.5:
-                        h_count += 1
-                    elif dy > dx * 1.5:
-                        v_count += 1
+                    ang = math.degrees(math.atan2(dy, dx)) % 180
+                    line_angles.append(ang)
                 except Exception:
                     continue
             elif kind == "re":
@@ -1170,19 +1212,31 @@ def detect_column_symbols(page):
                         ra = rw / rh if rh > 0 else 0
                         # Must be reasonably square and large enough to be a mark
                         if rw >= 4 and rh >= 4 and 0.25 < ra < 4.0:
-                            h_count += 2
-                            v_count += 1
+                            # A rectangle has 2 parallel + 2 perpendicular lines
+                            line_angles.extend([0, 0, 90, 90])
                             n_lines += 4
                     except Exception:
                         pass
 
         aspect = w / h if h > 0 else 0
 
-        # ── Accept I/H shape: ≥2 flange lines (H) + ≥1 web line (V) ──────────
-        # Requiring TWO horizontal segments (top flange + bottom flange) prevents
-        # L-shapes, corner marks, stiffener ticks, and connection detail boxes
-        # (which typically have only 1 H + 1 V) from being falsely accepted.
-        if not has_curve and h_count >= 2 and v_count >= 1:
+        # ── Accept I/H shape at ANY rotation ──────────────────────────────────
+        # Check if there are at least two parallel lines (flanges) and at least
+        # one line perpendicular to them (web). This handles 0°, 90°, and any
+        # arbitrary "sloped" / angled column symbols.
+        is_i_shape = False
+        if len(line_angles) >= 3:
+            for i, a1 in enumerate(line_angles):
+                # Find all lines parallel to a1 (±15°)
+                parallel = [a for a in line_angles if min(abs(a - a1), 180 - abs(a - a1)) < 15]
+                if len(parallel) >= 2:
+                    # Look for a web line perpendicular to a1 (90° ± 15°)
+                    perp = [a for a in line_angles if 75 < min(abs(a - a1), 180 - abs(a - a1)) < 105]
+                    if len(perp) >= 1:
+                        is_i_shape = True
+                        break
+
+        if not has_curve and is_i_shape:
             raw.append((cx, cy))
             continue
 
@@ -1201,7 +1255,7 @@ def detect_column_symbols(page):
         # Many CAD drawings ring the column I/H mark with a small circle.
         # Grid bubbles are large (>45pt); section-cut bubbles rarely have both
         # H and V lines inside them. Limit to bbox 10–45pt to stay specific.
-        if has_curve and h_count >= 2 and v_count >= 1 and 10 < w < 45 and 10 < h < 45:
+        if has_curve and is_i_shape and 10 < w < 45 and 10 < h < 45:
             raw.append((cx, cy))
 
     # Deduplicate using EXPANDING cluster (DBSCAN-style, eps=15pt).
@@ -1396,6 +1450,7 @@ def detect_beam_lines_raster(img_path: str, profiles: list,
 
     h_lines: list[tuple] = []   # (x1, y, x2, y, length)
     v_lines: list[tuple] = []   # (x, y1, x, y2, length)
+    d_lines: list[tuple] = []   # (x1, y1, x2, y2, length)
 
     for seg in raw:
         x1r, y1r, x2r, y2r = seg[0]
@@ -1411,9 +1466,12 @@ def detect_beam_lines_raster(img_path: str, profiles: list,
         elif dy > dx * DIR_R and ln <= MAX_V:
             mx = (x1 + x2) / 2
             v_lines.append((mx, min(y1, y2), mx, max(y1, y2), ln))
+        else:
+            if ln <= max(MAX_H, MAX_V):
+                d_lines.append((x1, y1, x2, y2, ln))
 
     print(f"[RASTER_BEAM] MAX_H={MAX_H:.0f}px MAX_V={MAX_V:.0f}px  "
-          f"H lines: {len(h_lines)}  V lines: {len(v_lines)}")
+          f"H lines: {len(h_lines)}  V lines: {len(v_lines)}  D lines: {len(d_lines)}")
 
     result: dict = {}
     for p_idx, p in enumerate(profiles):
@@ -1444,6 +1502,23 @@ def detect_beam_lines_raster(img_path: str, profiles: list,
                 best_d = score
                 best = (lx, ly1, lx, ly2, ln)
                 best_dir = "V"
+
+        for (lx1, ly1, lx2, ly2, ln) in d_lines:
+            # point-to-line distance
+            den = math.hypot(lx2 - lx1, ly2 - ly1)
+            num = abs((lx2 - lx1) * (ly1 - pcy) - (lx1 - pcx) * (ly2 - ly1))
+            dist = num / den if den > 0 else float('inf')
+            if dist > LABEL_R:
+                continue
+            # check if projection is within segment
+            dot = ((pcx - lx1)*(lx2 - lx1) + (pcy - ly1)*(ly2 - ly1)) / (den*den) if den > 0 else -1
+            if dot < -0.1 or dot > 1.1:
+                continue
+            score = dist - ln * 0.01
+            if score < best_d:
+                best_d = score
+                best = (lx1, ly1, lx2, ly2, ln)
+                best_dir = "D"
 
         if best:
             result[p_idx] = {
@@ -1534,14 +1609,20 @@ def extract_grid_lines(page, page_w, page_h, plan_bounds, text_dict=None):
             return [], []
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
-        x_spread = max(xs) - min(xs)
-        y_spread = max(ys) - min(ys)
-        if x_spread >= y_spread:
-            # Bubbles form a horizontal row → label vertical grid lines → use X
-            return xs, []
+        # Count unique positions per axis (tolerance 20 pts).
+        # Spread fails when labels appear on BOTH left AND right edges
+        # (e.g. letter grid A-G repeated) — x_spread becomes huge and letters
+        # get mis-classified as v_grid, leaving h_grid empty.
+        def _uniq(vals, tol=20):
+            seen = []
+            for v in sorted(vals):
+                if not seen or abs(v - seen[-1]) > tol:
+                    seen.append(v)
+            return len(seen)
+        if _uniq(xs) >= _uniq(ys):
+            return xs, []   # horizontal row of bubbles → vertical grid lines
         else:
-            # Bubbles form a vertical column → label horizontal grid lines → use Y
-            return [], ys
+            return [], ys   # vertical column of bubbles → horizontal grid lines
 
     lv, lh = _classify_family(letter_pts)
     nv, nh = _classify_family(number_pts)
@@ -1729,8 +1810,10 @@ def detect_schedule_zones(page, plan_bounds, text_dict=None):
         if x_spread < 8 and y_spread > 250:
             zone = (min(xs) - 60, min(ys) - 40, max(xs) + 60, max(ys) + 40)
             excluded.append(zone)
-            print(f"[SCHEDULE] Excluded zone x=[{min(xs):.0f},{max(xs):.0f}] "
+            print(f"[SCHEDULE] Col-cluster x=[{min(xs):.0f},{max(xs):.0f}] "
                   f"y=[{min(ys):.0f},{max(ys):.0f}] n={len(cluster)}")
+
+
 
     return excluded
 
@@ -1752,10 +1835,9 @@ def extract_profiles(page, page_w, page_h, plan_bounds, text_dict=None):
         if not text:
             return
         # Allow labels up to 60 pt outside the plan boundary.
-        # Edge beams (top/bottom chord, right-most column strip) and cantilever
-        # labels often sit right on the boundary line or just beyond it.
-        # 60 pt ≈ 6.7 ft at 1/8" scale — enough to catch any edge label while
-        # still excluding notes / title-block text which sits 200+ pt away.
+        # Edge beams and cantilever labels sit right on or just beyond the
+        # boundary line.  60 pt ≈ 6 ft at 1/8" scale is enough without
+        # pulling in title-block / note text far outside the plan.
         _LABEL_EDGE = 60
         if not (bx0 - _LABEL_EDGE <= cx <= bx1 + _LABEL_EDGE and
                 by0 - _LABEL_EDGE <= cy <= by1 + _LABEL_EDGE):
@@ -1772,8 +1854,11 @@ def extract_profiles(page, page_w, page_h, plan_bounds, text_dict=None):
                     profiles.append({
                         "profile": normalize_profile(m.group(0)),
                         "cx": cx, "cy": cy,
-                        # dir_hint: passes 1 & 2 found rotated (vertical) labels
-                        "dir_hint": "V" if rot_pass in (1, 2) else "H",
+                        # dir_hint: OCR rotation passes 1/2 → V-beam (raster).
+                        # Also treat vector-PDF labels whose bounding box is
+                        # taller than wide as V-beam — 90°-rotated text in CAD
+                        # drawings has bbox_h >> bbox_w even though rot_pass=0.
+                        "dir_hint": "V" if (rot_pass in (1, 2) or bbox_h > bbox_w * 1.5) else "H",
                         # bbox dimensions — used by detect_beam_lines to infer
                         # expected beam direction (wide text → H beam; tall → V)
                         "bbox_w": max(bbox_w, 1.0),
@@ -1938,13 +2023,16 @@ def _span_valid(bx1f, by1f, bx2f, by2f, lx_frac, ly_frac, beam_dir) -> bool:
         x_lo = min(bx1f, bx2f) - EXT_TOL
         x_hi = max(bx1f, bx2f) + EXT_TOL
         return x_lo <= lx_frac <= x_hi
-    else:   # "V"
+    elif beam_dir == "V":
         span_x = (bx1f + bx2f) / 2
         if abs(lx_frac - span_x) > PERP_TOL:
             return False
         y_lo = min(by1f, by2f) - EXT_TOL
         y_hi = max(by1f, by2f) + EXT_TOL
         return y_lo <= ly_frac <= y_hi
+    else:  # "D"
+        # For diagonal beams, we matched the vector line directly, so it is inherently valid.
+        return True
 
 
 def build_members(profiles, page_w, page_h,
@@ -2212,8 +2300,22 @@ def build_members(profiles, page_w, page_h,
                         by1 = round(line_hit["y1"] / page_h, 4)
                         bx2 = round(line_hit["x2"] / page_w, 4)
                         by2 = round(line_hit["y2"] / page_h, 4)
-                        # Chip renders at the TRUE midpoint of the span so the
-                        # chip and the SVG line always coincide visually.
+                        # Snap perpendicular axis to nearest grid line so beams
+                        # visually connect to column/row centrelines.
+                        # V-beams: snap X → v_grid; H-beams: snap Y → h_grid.
+                        # Tolerance 60 pt — large enough to bridge a column-face
+                        # offset but too small to jump to the next grid line.
+                        _JOIN_TOL = 60.0
+                        if beam_dir == "V" and v_grid:
+                            _rx = (line_hit["x1"] + line_hit["x2"]) / 2
+                            _gx = min(v_grid, key=lambda g: abs(g - _rx))
+                            if abs(_gx - _rx) <= _JOIN_TOL:
+                                bx1 = bx2 = round(_gx / page_w, 4)
+                        elif beam_dir == "H" and h_grid:
+                            _ry = (line_hit["y1"] + line_hit["y2"]) / 2
+                            _gy = min(h_grid, key=lambda g: abs(g - _ry))
+                            if abs(_gy - _ry) <= _JOIN_TOL:
+                                by1 = by2 = round(_gy / page_h, 4)
                         render_cx = (line_hit["x1"] + line_hit["x2"]) / 2
                         render_cy = (line_hit["y1"] + line_hit["y2"]) / 2
 
